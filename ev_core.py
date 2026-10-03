@@ -88,9 +88,12 @@ def parse_prob(text):
 def parse_book_odds(text):
     """'DraftKings +150, FanDuel +145' -> [('DraftKings', 150), ('FanDuel', 145)]."""
     out = []
-    parts = [p.strip() for p in re.split(r"[,;\n]", text) if p.strip()]
+    parts = []
+    for chunk in re.split(r"[,;\n]", text):
+        # also split when the comma is missing: "DraftKings +150 FanDuel +145"
+        parts += [p.strip() for p in re.split(r"(?<=\d)\s+(?=[A-Za-z])", chunk.strip()) if p.strip()]
     for i, part in enumerate(parts, start=1):
-        part = part.replace(":", " ").replace("=", " ")
+        part = part.replace(":", " ").replace("=", " ").strip().rstrip(".!?;")  # phone keyboards add a trailing "."
         m = re.match(r"^(?:(.*?)\s+)?([+-]?\d+)$", part.strip())
         if not m:
             raise ValueError(f"Couldn't read '{part}'. Use: DraftKings +150, FanDuel +145")
@@ -104,7 +107,7 @@ def parse_book_odds(text):
 def parse_legs(text):
     """'+150@45, -110@55' -> [(150, 0.45), (-110, 0.55)]."""
     out = []
-    for part in [p.strip() for p in text.split(",") if p.strip()]:
+    for part in [p.strip().rstrip(".!?;") for p in text.split(",") if p.strip()]:
         m = re.match(r"^([+-]?\d+)\s*[@/ ]\s*([\d.]+%?)$", part)
         if not m:
             raise ValueError(f"Couldn't read leg '{part}'. Use: +150@45, -110@55 (odds@true %)")
