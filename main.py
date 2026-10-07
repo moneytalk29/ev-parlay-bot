@@ -74,4 +74,752 @@ LIVE_LINE_MODE = os.getenv("HB_LIVE_LINE_MODE", "full").lower()
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
            "Origin": "https://app.prizepicks.com", "Referer": "https://app.prizepicks.com/"}
-ESPN = {"NFL": "https://site.api
+ESPN = {"NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl",
+        "NBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"}
+GAME_SECONDS = {"NFL": 3600.0, "NBA": 2880.0}
+PERIOD_SECONDS = {"NFL": 900.0, "NBA": 720.0}
+
+# PrizePicks stat name (lowercase) -> (stat key, group)
+STAT_MAP = {
+    "NFL": {"pass yards": ("pass_yds", "pass"), "passing yards": ("pass_yds", "pass"),
+            "pass attempts": ("pass_att", "pass"), "pass completions": ("pass_cmp", "pass"),
+            "rush yards": ("rush_yds", "rush"), "rushing yards": ("rush_yds", "rush"),
+            "rush attempts": ("rush_att", "rush"), "rushing attempts": ("rush_att", "rush"), "carries": ("rush_att", "rush"),
+            "receiving yards": ("rec_yds", "rec"), "rec yards": ("rec_yds", "rec"),
+            "receptions": ("rec_cnt", "rec")},
+    "NBA": {"points": ("pts", "nba"), "rebounds": ("reb", "nba"), "assists": ("ast", "nba"),
+            "3-pt made": ("fg3", "nba"), "3-pointers made": ("fg3", "nba"), "three pointers made": ("fg3", "nba"),
+            "3pt made": ("fg3", "nba"),
+            "pts+rebs+asts": ("pra", "nba"), "points+rebounds+assists": ("pra", "nba"), "pra": ("pra", "nba"),
+            "fantasy score": ("fant", "nba"), "fantasy points": ("fant", "nba")},
+}
+STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp": "Pass Completions",
+              "rush_yds": "Rush Yards", "rush_att": "Rush Attempts",
+              "rec_yds": "Receiving Yards", "rec_cnt": "Receptions",
+              "pts": "Points", "reb": "Rebounds", "ast": "Assists", "fg3": "3-PT Made",
+              "pra": "Pts+Rebs+Asts", "fant": "Fantasy Score"}
+MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
+                "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0}
+YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "rec_yds": 0.8, "pass_cmp": 0.9, "rec_cnt": 0.9}   # efficiency changes with the script, so shrink these
+# v1.3: VOLUME props (attempts, carries, catches) follow the game script more reliably than YARD props (a trailing QB can
+# throw 42 times and still miss his yards). Yard props need a bigger gap to alert, and volume props rank first when pairing.
+YARD_STATS = ("pass_yds", "rec_yds")      # rush yards are NOT here: a leading team runs on purpose, so they follow the script closely
+YARD_EDGE_MULT = float(os.getenv("HB_YARD_EDGE_MULT", "1.3"))
+PRIORITY = {"pass_att": 1.2, "rush_att": 1.15, "rec_cnt": 1.05, "pass_cmp": 1.0,
+            "rush_yds": 1.1, "rec_yds": 0.9, "pass_yds": 0.8, "fant": 0.95}
+BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter", "combo", "+", "(", "longest",
+             "fantasy", "first", "last", "total")
+
+_session = requests.Session()
+_session.headers.update(HEADERS)
+_state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {},
+          "live_logged": set(), "pending": {}, "snap": {}, "names": {}, "names_printed": 0}
+
+
+# ====================== SMALL HELPERS ======================
+def _norm(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"[^a-z ]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _to_dt(s):
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(x, default=0.0):
+    try:
+        return float(str(x).replace("+", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _split_pair(x):
+    """'20/35' or '3-15' -> (20, 35)"""
+    m = re.match(r"^\s*(\d+)\s*[/\-]\s*(\d+)\s*$", str(x or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def _clock_seconds(txt):
+    txt = str(txt or "0:00").strip()
+    try:
+        if ":" in txt:
+            m, s = txt.split(":")[:2]
+            return int(m) * 60 + float(s)
+        return float(txt)
+    except ValueError:
+        return 0.0
+
+
+_H1 = re.compile(r"\b(1h|1st half|first half|h1)\b")
+_H2 = re.compile(r"\b(2h|2nd half|second half|h2)\b")
+_QTR = re.compile(r"\b(1q|2q|3q|4q|q1|q2|q3|q4|quarter)\b")
+
+
+def classify_nba(raw):
+    """PrizePicks NBA stat name -> (stat key, half) where half is None (full game), 1 or 2. None if we don't model it."""
+    s = str(raw).lower()
+    if _QTR.search(s):
+        return None
+    half = 1 if _H1.search(s) else 2 if _H2.search(s) else None
+    s = _H2.sub(" ", _H1.sub(" ", s))
+    s = s.replace("combo", " ")
+    s = re.sub(r"[()]", " ", s)
+    s = re.sub(r"\s+-\s+", " ", s)
+    s = re.sub(r"\s*\+\s*", "+", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    stat = STAT_MAP["NBA"].get(s)
+    return (stat[0], half) if stat else None
+
+
+def derive(p):
+    """Adds the combined NBA stats (PRA and fantasy score) from the basic ones."""
+    pts, reb, ast = p.get("pts", 0.0), p.get("reb", 0.0), p.get("ast", 0.0)
+    p["pra"] = pts + reb + ast
+    w = FANT
+    p["fant"] = pts * w[0] + reb * w[1] + ast * w[2] + p.get("stl", 0.0) * w[3] + p.get("blk", 0.0) * w[4] + p.get("tov", 0.0) * w[5]
+    return p
+
+
+RAW_NBA = ("minutes", "pts", "reb", "ast", "fg3", "stl", "blk", "tov")
+
+
+def half_stats(cur, snap_p):
+    """What a player did since the snapshot (2nd half = full box minus the halftime box)."""
+    out = {"team_id": cur.get("team_id"), "pf": cur.get("pf", 0.0)}
+    for k in RAW_NBA:
+        out[k] = max(0.0, cur.get(k, 0.0) - (snap_p or {}).get(k, 0.0))
+    return derive(out)
+
+
+def stat_label(line):
+    return ({1: "1H ", 2: "2H "}.get(line.get("half"), "")) + STAT_LABEL[line["stat"]]
+
+
+def _post(payload):
+    if not WEBHOOK_URL:
+        print("no WEBHOOK_URL set, would have posted:", str(payload)[:300])
+        return
+    for _ in range(4):
+        try:
+            r = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+        except requests.RequestException as e:
+            print("discord post failed:", e)
+            time.sleep(2)
+            continue
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 2))
+            except Exception:
+                wait = 2.0
+            time.sleep(min(wait, 10) + 0.3)
+            continue
+        if r.status_code >= 300:
+            print("discord error", r.status_code, r.text[:120])
+        return
+
+
+# ====================== PRIZEPICKS ======================
+def fetch_board():
+    r = _session.get(PP_URL, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def parse_board(data):
+    """Returns {(sport, norm_name, stat): line dict} for the NFL/NBA lines we can model."""
+    players, leagues, games = {}, {}, {}
+    for inc in data.get("included", []):
+        a = inc.get("attributes", {})
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = (a.get("name", ""), a.get("team") or a.get("team_name") or "", a.get("position") or "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+        elif inc.get("type") == "game":
+            games[inc["id"]] = a
+    out, seen_keys = {}, set()
+    for item in data.get("data", []):
+        try:
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            sport = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            if sport not in SPORTS:
+                continue
+            seen_keys.update(a.keys())
+            stat_name = str(a.get("stat_display_name") or a.get("stat_type") or "").lower().strip()
+            _state["names"].setdefault(sport, set()).add(stat_name)
+            half = None
+            if sport == "NBA":
+                cl = classify_nba(stat_name)
+                if not cl:
+                    continue
+                stat, half = (cl[0], "nba"), cl[1]
+            else:
+                if any(b in stat_name for b in BAD_WORDS):
+                    continue
+                stat = STAT_MAP.get(sport, {}).get(stat_name)
+                if not stat:
+                    continue
+            odds_type = str(a.get("odds_type") or "standard").lower()
+            if odds_type != "standard":              # goblin/demon lines pay differently, so skip them
+                continue
+            name, team, pos = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), ("", "", ""))
+            if not name:
+                continue
+            gid = (rel.get("game", {}).get("data") or {}).get("id")
+            start = a.get("start_time") or (games.get(gid) or {}).get("start_time") or ""
+            flags = {k: a.get(k) for k in ("status", "is_live", "in_game", "is_promo", "odds_type", "board_time") if k in a}
+            for k, v in flags.items():
+                _state["flags_seen"].setdefault(k, set()).add(str(v))
+            live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
+                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress"))
+            key = (sport, _norm(name), stat[0], half)
+            if key in out and out[key]["live"] and not live_row:
+                continue                             # a live row for this player/stat beats a stale pregame row
+            out[key] = {
+                "sport": sport, "name": name, "norm": _norm(name), "team": team, "pos": pos,
+                "stat": stat[0], "group": stat[1], "half": half, "line": _num(a.get("line_score")),
+                "start": _to_dt(start), "opp": a.get("description") or "", "flags": flags, "live": live_row}
+        except Exception:
+            continue
+    _state["keys_seen"] |= seen_keys
+    return out
+
+
+# ====================== ESPN ======================
+def _get_json(url):
+    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.json()
+
+
+def live_events(sport):
+    """List of live games: id, period, clock seconds, elapsed fraction, team scores by ESPN team id."""
+    out = []
+    data = _get_json(ESPN[sport] + "/scoreboard")
+    for ev in data.get("events", []) or []:
+        st = ev.get("status", {})
+        if (st.get("type") or {}).get("state") != "in":
+            continue
+        comp = (ev.get("competitions") or [{}])[0]
+        teams = {}
+        for c in comp.get("competitors", []):
+            t = c.get("team", {})
+            teams[str(t.get("id"))] = {"score": int(_num(c.get("score"))), "abbr": t.get("abbreviation", ""),
+                                        "name": t.get("displayName", ""), "home": c.get("homeAway") == "home"}
+        period = int(st.get("period") or 0)
+        clock = _clock_seconds(st.get("displayClock"))
+        total, per = GAME_SECONDS[sport], PERIOD_SECONDS[sport]
+        if period < 1 or period > 4 or len(teams) != 2:
+            continue                                   # overtime or odd data: skip
+        elapsed = (period - 1) * per + (per - min(clock, per))
+        tname = str((st.get("type") or {}).get("name") or "")
+        halftime = sport == "NBA" and (tname == "STATUS_HALFTIME" or (period == 2 and clock <= 1.0))
+        out.append({"id": ev.get("id"), "name": ev.get("name", ""), "period": period, "clock": clock, "halftime": halftime,
+                    "f": max(0.0, min(1.0, elapsed / total)), "teams": teams,
+                    "clock_txt": st.get("displayClock", "")})
+    return out
+
+
+def box_score(sport, event_id):
+    """{norm player name: {...stats, 'team_id'}} from ESPN's box score. Cached for ESPN_POLL seconds."""
+    hit = _state["summ"].get((sport, event_id))
+    if hit and time.time() - hit[0] < ESPN_POLL * 0.8:
+        return hit[1]
+    data = _get_json(f"{ESPN[sport]}/summary?event={event_id}")
+    res = {}
+    for team in (data.get("boxscore") or {}).get("players", []):
+        tid = str((team.get("team") or {}).get("id"))
+        for cat in team.get("statistics", []):
+            labels = cat.get("labels") or []
+            cname = (cat.get("name") or "").lower()
+            for ath in cat.get("athletes", []):
+                nm = _norm((ath.get("athlete") or {}).get("displayName", ""))
+                vals = ath.get("stats") or []
+                if not nm or not vals or len(vals) != len(labels):
+                    continue
+                row = dict(zip(labels, vals))
+                p = res.setdefault(nm, {"team_id": tid})
+                if sport == "NFL":
+                    if cname == "passing":
+                        cmp_, att = _split_pair(row.get("C/ATT"))
+                        p.update(pass_cmp=cmp_, pass_att=att, pass_yds=_num(row.get("YDS")))
+                    elif cname == "rushing":
+                        p.update(rush_att=_num(row.get("CAR")), rush_yds=_num(row.get("YDS")))
+                    elif cname == "receiving":
+                        p.update(rec_cnt=_num(row.get("REC")), rec_yds=_num(row.get("YDS")))
+                else:
+                    made, _ = _split_pair(row.get("3PT"))
+                    p.update(minutes=_num(row.get("MIN")), pts=_num(row.get("PTS")), reb=_num(row.get("REB")),
+                             ast=_num(row.get("AST")), fg3=float(made), stl=_num(row.get("STL")), blk=_num(row.get("BLK")),
+                             tov=_num(row.get("TO")), pf=_num(row.get("PF")))
+                    derive(p)
+    _state["summ"][(sport, event_id)] = (time.time(), res)
+    return res
+
+
+# ====================== MODEL ======================
+def _blend_total(prior, current, f):
+    """Full-game expectation: the pregame line, nudged toward the player's pace so far."""
+    if f >= 0.2 and current is not None:
+        w = min(PACE_WEIGHT_MAX, 0.7 * f)
+        return (1 - w) * prior + w * (current / f)
+    return prior
+
+
+def nfl_script(group, stat, margin, f):
+    """Volume multiplier for the rest of the game, from the team's score margin (+ = leading)."""
+    scale = 0.4 + 0.6 * f                         # an early deficit says less than a late one
+    units = abs(margin) / 7.0
+    if group in ("pass", "rec"):                  # receivers ride the same team passing volume as the QB
+        m = (1 + min(PASS_TRAIL_CAP, PASS_TRAIL * units * scale)) if margin < 0 else \
+            (1 - min(PASS_LEAD_CAP, PASS_LEAD * units * scale)) if margin > 0 else 1.0
+    else:
+        m = (1 + min(RUSH_LEAD_CAP, RUSH_LEAD * units * scale)) if margin > 0 else \
+            (1 - min(RUSH_TRAIL_CAP, RUSH_TRAIL * units * scale)) if margin < 0 else 1.0
+    damp = YARD_DAMP.get(stat, 1.0)
+    return 1 + (m - 1) * damp
+
+
+def project_nfl(line, cur, prior, f, margin):
+    r = 1 - f
+    total = _blend_total(prior, cur.get(line["stat"]), f)
+    m = nfl_script(line["group"], line["stat"], margin, f)
+    c = cur.get(line["stat"], 0.0)
+    proj = c + total * r * m
+    notes = [f"Pace baseline {total:.1f} for the full game (pregame line {prior:g})",
+             f"Script factor ×{m:.2f} on the rest of the game (team {'leads' if margin > 0 else 'trails' if margin < 0 else 'tied'}"
+             + (f" by {abs(margin)}" if margin else "") + ")"]
+    if margin >= 21 and f >= 0.7:
+        notes.append("⚠️ Big lead late: starters may sit, which supports unders")
+    return proj, m, notes
+
+
+def project_nba(line, cur, prior, f, period, margin_abs):
+    c = cur.get(line["stat"], 0.0)
+    mins = cur.get("minutes", 0.0)
+    base_rate = prior / NBA_EXPECTED_MIN
+    rate = base_rate
+    if mins >= 8:
+        w = min(0.5, mins / 60.0)
+        rate = (1 - w) * base_rate + w * (c / mins)
+    exp_min = NBA_EXPECTED_MIN
+    if f >= 0.25 and mins > 0:
+        exp_min = max(20.0, min(40.0, 0.5 * NBA_EXPECTED_MIN + 0.5 * (mins / f)))
+    game_left = 48.0 * (1 - f)
+    rem_base = max(0.0, min(exp_min - mins, game_left))
+    adj, why = 1.0, ""
+    if period >= 3 and margin_abs >= NBA_BLOWOUT:
+        adj, why = 0.5, f"Blowout ({margin_abs:.0f} pts): starters likely to sit, minutes cut"
+        if margin_abs >= 30 or (period == 4 and margin_abs >= 25):
+            adj, why = 0.2, f"Deep blowout ({margin_abs:.0f} pts): starters very likely done"
+    elif period == 4 and margin_abs <= 6 and f >= 0.75:
+        adj, why = 1.15, f"Close finish ({margin_abs:.0f} pts): starters stay on the floor"
+    rem = min(rem_base * adj, game_left)
+    proj = c + rate * rem
+    notes = [f"{mins:.0f} min played, {c:g} so far, rate {rate:.2f}/min",
+             f"Expected {rem:.1f} more minutes (base {rem_base:.1f}, script ×{adj:.2f})"]
+    if why:
+        notes.append(why)
+    return proj, adj, notes
+
+
+def _foul_adj(half, pf, period):
+    """Minutes cut for foul trouble (guess): a player with many fouls sits."""
+    if half == 1:
+        return (0.6 if pf >= 4 else 0.8 if pf >= 3 else 1.0)
+    if half == 2:
+        return (0.6 if pf >= 5 else 0.8 if pf >= 4 else 1.0)
+    return 1.0
+
+
+def project_nba_half(line, event, cur_full, prior, margin_abs):
+    """1st-half or 2nd-half NBA prop. Returns (stat so far in THIS half, projection, script factor, notes) or None."""
+    half, stat = line["half"], line["stat"]
+    f, period = event["f"], event["period"]
+    sp = None
+    if half == 1:
+        if period >= 3 or event.get("halftime"):
+            return None                                   # the first half is over
+        prog = f / 0.5
+        if prog < HALF_MIN_ELAPSED or prog > 1 - HALF_MIN_REMAINING:
+            return None
+        cur = cur_full
+    else:
+        snap = _state["snap"].get(("NBA", event["id"]))
+        if snap is None:
+            return None                                   # no halftime snapshot (bot started late): can't split the halves
+        sp = snap.get(line["norm"])
+        if not sp or sp.get("minutes", 0) < 5:
+            return None                                   # didn't play the first half (or no data)
+        prog = max(0.0, (f - 0.5) / 0.5)
+        if prog > 1 - HALF_MIN_REMAINING:
+            return None
+        cur = half_stats(cur_full, sp)
+    mins, c = cur.get("minutes", 0.0), cur.get(stat, 0.0)
+    exp = NBA_EXP_H[half]
+    base_rate = prior / exp
+    rate = base_rate
+    if half == 2 and sp and sp.get("minutes", 0) >= 10:           # weak carry-over from the first half (hot/cold halves happen)
+        rate = 0.85 * base_rate + 0.15 * (sp.get(stat, 0.0) / sp["minutes"])
+    if mins >= 6:
+        w = min(0.5, mins / 40.0)
+        rate = (1 - w) * rate + w * (c / mins)
+    exp_min = exp
+    if prog >= 0.35 and mins > 0:
+        exp_min = max(8.0, min(22.0, 0.5 * exp + 0.5 * (mins / prog)))
+    half_left = 24.0 * (1 - prog)
+    rem_base = max(0.0, min(exp_min - mins, half_left))
+    adj, why = 1.0, ""
+    if half == 2:
+        if f < 0.6:                                                # start of the 2nd half: judge by the halftime score
+            if margin_abs >= 25:
+                adj, why = 0.75, f"{margin_abs:.0f}-point game at the half: starters likely get cut minutes"
+            elif margin_abs >= 18:
+                adj, why = 0.88, f"{margin_abs:.0f}-point game at the half: starters may lose some minutes"
+            elif margin_abs <= 4:
+                adj, why = 1.06, f"Close game at the half ({margin_abs:.0f}): starters should play heavy minutes"
+        elif period >= 3 and margin_abs >= NBA_BLOWOUT:
+            adj, why = 0.5, f"Blowout ({margin_abs:.0f} pts): starters likely to sit"
+            if margin_abs >= 30 or (period == 4 and margin_abs >= 25):
+                adj, why = 0.2, f"Deep blowout ({margin_abs:.0f} pts): starters very likely done"
+        elif period == 4 and margin_abs <= 6 and f >= 0.75:
+            adj, why = 1.15, f"Close finish ({margin_abs:.0f} pts): starters stay on the floor"
+    pf = cur_full.get("pf", 0.0)
+    fa = _foul_adj(half, pf, period)
+    notes = []
+    if half == 2 and sp:
+        notes.append(f"1st half: {sp.get('minutes', 0):.0f} min, {sp.get(stat, 0):g} {STAT_LABEL[stat]}; 2nd half so far: {mins:.0f} min, {c:g}")
+    else:
+        notes.append(f"{mins:.0f} min played this half, {c:g} so far, rate {rate:.2f}/min")
+    if fa < 1:
+        why = (why + " • " if why else "") + f"Foul trouble ({pf:.0f} fouls): minutes cut ×{fa:.2f}"
+    adj *= fa
+    rem = min(rem_base * adj, half_left)
+    proj = c + rate * rem
+    notes.append(f"Expected {rem:.1f} more minutes this half (base {rem_base:.1f}, script ×{adj:.2f})")
+    if why:
+        notes.append(why)
+    return c, proj, adj, notes
+
+
+def evaluate(line, event, box, prior):
+    """Returns an alert dict or None."""
+    f = event["f"]
+    half = line.get("half")
+    cur = box.get(line["norm"])
+    if not cur:
+        return None
+    team = event["teams"].get(cur["team_id"])
+    opp = next((t for tid, t in event["teams"].items() if tid != cur["team_id"]), None)
+    if not team or not opp:
+        return None
+    margin = team["score"] - opp["score"]
+    if line["sport"] == "NBA" and half:
+        res = project_nba_half(line, event, cur, prior, abs(margin))
+        if not res:
+            return None
+        c, proj, factor, notes = res
+        if line.get("prior_est"):
+            notes.append("No saved half line: baseline estimated from the full-game line")
+    else:
+        if f < MIN_ELAPSED or (1 - f) < MIN_REMAINING:
+            return None
+        if line["stat"] not in cur:
+            return None
+        c = cur[line["stat"]]
+        res = None
+    L = line["line"]
+    if line["live"] and LIVE_LINE_MODE == "rest":    # the line is only for the rest of the game: add what he has so far
+        L = c + line["line"]
+    if res is None:
+        if line["sport"] == "NFL":
+            proj, factor, notes = project_nfl(line, cur, prior, f, margin)
+        else:
+            if cur.get("minutes", 0) <= 0:
+                return None
+            proj, factor, notes = project_nba(line, cur, prior, f, event["period"], abs(margin))
+    if c >= L:                                       # the over has already hit (or the under is dead)
+        return None
+    gap = proj - L
+    min_abs = MIN_ABS_EDGE.get(line["stat"], 2) * (HALF_EDGE_SCALE if half else 1.0)
+    need = max(EDGE_PCT * L, min_abs)
+    if line["stat"] in YARD_STATS:
+        need *= YARD_EDGE_MULT                       # yards are riskier than volume, so ask for a bigger gap
+    if abs(gap) < need:
+        return None
+    if half == 1:
+        need *= float(os.getenv("HB_HALF1_EDGE_MULT", "1.25"))     # 1st-half props have no game-script edge, only pace, so ask for a bigger gap
+        if abs(gap) < need:
+            return None
+    elif SCRIPT_ONLY and abs(factor - 1) < SCRIPT_MIN:
+        return None
+    moved = L - prior
+    if abs(moved) >= 0.01:
+        notes.append(f"PrizePicks line has moved {moved:+g} since pregame (some of the script may already be priced in)")
+    if line["live"]:
+        notes.append("PrizePicks live line" + (" (rest-of-game, converted to a full-game number)" if LIVE_LINE_MODE == "rest" else ""))
+    shape = "lopsided" if abs(margin) >= LOPSIDED[line["sport"]] else "tight"
+    return {"direction": "OVER" if gap > 0 else "UNDER", "proj": proj, "gap": gap, "cur": c, "line": L,
+            "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved,
+            "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"]}
+
+
+# ====================== ALERTS ======================
+def _can_alert(key, direction):
+    now = time.time()
+    _state["sent"] = [t for t in _state["sent"] if now - t < 3600]
+    if len(_state["sent"]) >= MAX_PER_HOUR:
+        return False
+    last = _state["alerts"].get(key)
+    if last and last[1] == direction and now - last[0] < COOLDOWN:
+        return False
+    return True
+
+
+def _emoji(a):
+    return "🔥" if a["direction"] == "OVER" else "🧊"
+
+
+def _score_text(event, a):
+    t, o = a["team"], a["opp"]
+    return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • Q{event['period']} {event['clock_txt']}"
+
+
+def _leg_text(line, a):
+    return (f"**{line['name']}** — {stat_label(line)} **{line['line']:g}** → **{a['direction']}**\n"
+            f"Now **{a['cur']:g}** • Projected **{a['proj']:.1f}** (gap {a['gap']:+.1f})\n"
+            + "\n".join(f"• {n}" for n in a["notes"]))
+
+
+def _mark_sent(key, a):
+    _state["alerts"][key] = (time.time(), a["direction"])
+    _state["pending"].pop(key, None)
+
+
+def send_single(cand, label="no pair found"):
+    key, line, event, a = cand
+    _mark_sent(key, a)
+    _state["sent"].append(time.time())
+    footer = "Model v1.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    embed = {"title": f"{_emoji(a)} Heartbeat — LIVE {line['sport']} — LEAN {a['direction']}",
+             "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
+             "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
+             "footer": {"text": footer}}
+    _post({"embeds": [embed]})
+    print(f"ALERT(single) {line['sport']} {line['name']} {line.get('half') or 'full'} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
+          f"{a['direction']} cur {a['cur']} margin {a['margin']} f={event['f']:.2f}")
+
+
+def send_pair(c1, c2):
+    fields, legs = [], []
+    for key, line, event, a in (c1, c2):
+        _mark_sent(key, a)
+        fields.append({"name": f"{_emoji(a)} {line['name']} — {stat_label(line)} {a['direction']} {line['line']:g}",
+                       "value": f"{_leg_text(line, a)}\n_{event['name']} • {_score_text(event, a)}_"[:1000], "inline": False})
+        legs.append(f"{line['name']} {a['direction']} {line['line']:g}")
+    _state["sent"].append(time.time())
+    same_shape = c1[3]["shape"] == c2[3]["shape"]
+    embed = {"title": "💓 Heartbeat — LIVE PAIR — lock these two",
+             "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape else "") +
+                            ". Lines move fast, so check both are still available before you lock.",
+             "color": 15844367, "fields": fields,
+             "footer": {"text": "Model v1.4 • alert only • projections, not guarantees"}}
+    _post({"embeds": [embed]})
+    print(f"ALERT(pair) {' + '.join(legs)}")
+
+
+def process_candidates(fresh):
+    """fresh = [(key, line, event, alert)] that qualify on THIS cycle's data. Pairs them across different games."""
+    now = time.time()
+    live_keys = {c[0] for c in fresh}
+    for k in list(_state["pending"]):                 # a pick that stopped qualifying is dropped
+        if k not in live_keys:
+            del _state["pending"][k]
+    ready = []
+    for c in fresh:
+        if not _can_alert(c[0], c[3]["direction"]):
+            continue
+        _state["pending"].setdefault(c[0], now)
+        ready.append(c)
+    posted = 0
+    if not PAIR_MODE:
+        for c in ready:
+            send_single(c, label="")
+            posted += 1
+        return posted
+    ready.sort(key=lambda c: -c[3]["strength"])
+    used = set()
+    for i, c1 in enumerate(ready):
+        if c1[0] in used:
+            continue
+        best = None
+        for c2 in ready[i + 1:]:
+            if c2[0] in used or c2[3]["game"] == c1[3]["game"]:      # NEVER two legs from the same game
+                continue
+            same = c1[3]["shape"] == c2[3]["shape"]
+            if PAIR_REQUIRE_SAME_SHAPE and not same:
+                continue
+            score = c2[3]["strength"] + (PAIR_SAME_SHAPE_BONUS if same else 0.0)
+            if best is None or score > best[0]:
+                best = (score, c2)
+        if best:
+            send_pair(c1, best[1])
+            used |= {c1[0], best[1][0]}
+            posted += 1
+    for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
+        if c[0] not in used and now - _state["pending"].get(c[0], now) >= PAIR_WAIT:
+            send_single(c)
+            posted += 1
+    return posted
+
+
+def update_snapshot(ev, box):
+    """Saves every NBA player's box score at halftime. The 2nd half = current box minus this snapshot."""
+    k = ("NBA", ev["id"])
+    if ev.get("halftime"):
+        _state["snap"][k] = {n: dict(v) for n, v in box.items()}          # keeps refreshing until the 2nd half starts
+    elif ev["period"] == 3 and ev["clock"] >= PERIOD_SECONDS["NBA"] - 120 and k not in _state["snap"]:
+        _state["snap"][k] = {n: dict(v) for n, v in box.items()}          # bot woke up in the first 2 min of the 3rd: close enough
+
+
+def get_prior(key, ln):
+    """(prior, estimated?). Half lines with no saved line fall back to a share of the saved full-game line."""
+    p = _state["prior"].get(key)
+    if p is not None:
+        return p, False
+    if ln.get("half") in (1, 2):
+        fp = _state["prior"].get((ln["sport"], ln["norm"], ln["stat"], None))
+        if fp:
+            return fp * HALF_SHARE[ln["half"]], True
+    return None, False
+
+
+def discovery_report(board, live):
+    nfl = sum(1 for k in board if k[0] == "NFL")
+    nba = sum(1 for k in board if k[0] == "NBA")
+    flags = {k: sorted(v)[:6] for k, v in _state["flags_seen"].items()}
+    lines = [f"Sports tracked: {', '.join(SPORTS)}",
+             f"PrizePicks lines I can model right now: NFL {nfl}, NBA {nba}",
+             f"Live games right now: {sum(len(v) for v in live.values())}",
+             f"PrizePicks attribute names seen: {', '.join(sorted(_state['keys_seen'])) or 'none yet'}",
+             f"Status/odds flags seen: {flags or 'none'}"]
+    nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
+    lines.append(f"NBA half-game lines I can model: {nba_half}")
+    nm = sorted(_state["names"].get("NBA", set()))
+    if nm:
+        lines.append("NBA stat names on the board: " + ", ".join(nm)[:600])
+    print("DISCOVERY:", " | ".join(lines))
+    if DISCOVERY_POST:
+        _post({"embeds": [{"title": "💓 Heartbeat online", "description": "\n".join(f"• {x}" for x in lines),
+                           "color": 3066993}]})
+
+
+# ====================== MAIN LOOP ======================
+def update_priors(board, live_names):
+    """Save each line's value from before kickoff. Frozen once the game has started."""
+    now = _now()
+    for key, ln in board.items():
+        started = (ln["live"] or (ln["start"] is not None and now >= ln["start"])
+                   or ln["norm"] in live_names.get(ln["sport"], set()))
+        if not started and ln["line"] > 0:
+            _state["prior"][key] = ln["line"]
+
+
+def cycle(first=False):
+    # 1) PrizePicks
+    try:
+        board = parse_board(fetch_board())
+    except Exception as e:
+        print("PrizePicks error:", e)
+        return
+    _state["board"] = board
+    # 2) ESPN live games + box scores
+    live, boxes, live_names = {}, {}, {}
+    budget = MAX_SUMMARIES
+    for sport in SPORTS:
+        try:
+            live[sport] = live_events(sport)
+        except Exception as e:
+            print(f"ESPN scoreboard error ({sport}):", e)
+            live[sport] = []
+        live_names[sport] = set()
+        for ev in live[sport]:
+            if budget <= 0:
+                break
+            try:
+                boxes[(sport, ev["id"])] = box_score(sport, ev["id"])
+                budget -= 1
+                live_names[sport] |= set(boxes[(sport, ev["id"])].keys())
+                if sport == "NBA":
+                    update_snapshot(ev, boxes[(sport, ev["id"])])
+            except Exception as e:
+                print(f"ESPN box score error ({sport} {ev['id']}):", e)
+    update_priors(board, live_names)
+    n_names = sum(len(v) for v in _state["names"].values())
+    if n_names != _state["names_printed"]:                 # new PrizePicks stat names showed up: log them so we can match them
+        _state["names_printed"] = n_names
+        for sp_, nm_ in _state["names"].items():
+            print(f"STAT NAMES {sp_}:", " | ".join(sorted(nm_))[:1500])
+    if first:
+        discovery_report(board, live)
+    # 3) project every tracked line that belongs to a live game
+    sent = checked = 0
+    fresh = []
+    for key, ln in board.items():
+        sport = ln["sport"]
+        for ev in live.get(sport, []):
+            box = boxes.get((sport, ev["id"]))
+            if not box or ln["norm"] not in box:
+                continue
+            prior, est = get_prior(key, ln)
+            ln["prior_est"] = est
+            if prior is None:
+                if not ALLOW_NO_PRIOR:
+                    continue
+                prior = ln["line"]
+            checked += 1
+            if ln["live"] and key not in _state["live_logged"]:     # log the first live rows so we can see what they mean
+                _state["live_logged"].add(key)
+                if len(_state["live_logged"]) <= 40:
+                    print(f"LIVE ROW: {ln['name']} {ln.get('half') or 'full'} {ln['stat']} live line {ln['line']:g} | pregame line {prior:g} | "
+                          f"he has {box[ln['norm']].get(ln['stat'])} so far | game {ev['f']:.0%} done | flags {ln['flags']}")
+            a = evaluate(ln, ev, box, prior)
+            if a:
+                fresh.append((key, ln, ev, a))
+            break
+    sent = process_candidates(fresh)
+    n_live = sum(len(v) for v in live.values())
+    if n_live or first:
+        print(f"cycle: {n_live} live games, {len(board)} lines tracked, {checked} projected, {sent} alerts")
+
+
+def main():
+    if not WEBHOOK_URL:
+        print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
+    print(f"Heartbeat starting. Sports: {SPORTS}. PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
+    first = True
+    last_pp = 0.0
+    while True:
+        try:
+            cycle(first)
+            first = False
+        except Exception as e:
+            print("cycle error:", e)
+        # poll fast only while games are live; otherwise relax
+        any_live = any(_state["summ"]) and any(time.time() - v[0] < 120 for v in _state["summ"].values())
+        time.sleep(min(PP_POLL, ESPN_POLL) if any_live else max(PP_POLL, 60))
+
+
+if __name__ == "__main__":
+    main()
