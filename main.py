@@ -51,6 +51,9 @@ RUSH_TRAIL, RUSH_TRAIL_CAP = float(os.getenv("HB_RUSH_TRAIL", "0.09")), float(os
 # NBA
 NBA_EXPECTED_MIN = float(os.getenv("HB_NBA_EXPECTED_MIN", "32"))   # a typical starter's minutes
 NBA_BLOWOUT = float(os.getenv("HB_NBA_BLOWOUT", "20"))             # point gap where starters start to sit (3rd/4th quarter)
+# What a LIVE PrizePicks line means: "full" = the player's full-game total (default), "rest" = just the rest of the game.
+# The first live game will show which one it is (see the "LIVE ROW" log lines). Change this if it turns out to be "rest".
+LIVE_LINE_MODE = os.getenv("HB_LIVE_LINE_MODE", "full").lower()
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
            "Origin": "https://app.prizepicks.com", "Referer": "https://app.prizepicks.com/"}
@@ -80,7 +83,8 @@ BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter"
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
-_state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {}}
+_state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {},
+          "live_logged": set()}
 
 
 # ====================== SMALL HELPERS ======================
@@ -195,10 +199,15 @@ def parse_board(data):
             flags = {k: a.get(k) for k in ("status", "is_live", "in_game", "is_promo", "odds_type", "board_time") if k in a}
             for k, v in flags.items():
                 _state["flags_seen"].setdefault(k, set()).add(str(v))
-            out[(sport, _norm(name), stat[0])] = {
+            live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
+                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress"))
+            key = (sport, _norm(name), stat[0])
+            if key in out and out[key]["live"] and not live_row:
+                continue                             # a live row for this player/stat beats a stale pregame row
+            out[key] = {
                 "sport": sport, "name": name, "norm": _norm(name), "team": team, "pos": pos,
                 "stat": stat[0], "group": stat[1], "line": _num(a.get("line_score")),
-                "start": _to_dt(start), "opp": a.get("description") or "", "flags": flags}
+                "start": _to_dt(start), "opp": a.get("description") or "", "flags": flags, "live": live_row}
         except Exception:
             continue
     _state["keys_seen"] |= seen_keys
@@ -350,7 +359,10 @@ def evaluate(line, event, box, prior):
     if not team or not opp:
         return None
     margin = team["score"] - opp["score"]
-    L, c = line["line"], cur[line["stat"]]
+    c = cur[line["stat"]]
+    L = line["line"]
+    if line["live"] and LIVE_LINE_MODE == "rest":    # the line is only for the rest of the game: add what he has so far
+        L = c + line["line"]
     if line["sport"] == "NFL":
         proj, factor, notes = project_nfl(line, cur, prior, f, margin)
     else:
@@ -368,6 +380,8 @@ def evaluate(line, event, box, prior):
     moved = L - prior
     if abs(moved) >= 0.01:
         notes.append(f"PrizePicks line has moved {moved:+g} since pregame (some of the script may already be priced in)")
+    if line["live"]:
+        notes.append("PrizePicks live line" + (" (rest-of-game, converted to a full-game number)" if LIVE_LINE_MODE == "rest" else ""))
     return {"direction": "OVER" if gap > 0 else "UNDER", "proj": proj, "gap": gap, "cur": c, "line": L,
             "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved}
 
@@ -427,7 +441,8 @@ def update_priors(board, live_names):
     """Save each line's value from before kickoff. Frozen once the game has started."""
     now = _now()
     for key, ln in board.items():
-        started = (ln["start"] is not None and now >= ln["start"]) or ln["norm"] in live_names.get(ln["sport"], set())
+        started = (ln["live"] or (ln["start"] is not None and now >= ln["start"])
+                   or ln["norm"] in live_names.get(ln["sport"], set()))
         if not started and ln["line"] > 0:
             _state["prior"][key] = ln["line"]
 
@@ -476,6 +491,11 @@ def cycle(first=False):
                     continue
                 prior = ln["line"]
             checked += 1
+            if ln["live"] and key not in _state["live_logged"]:     # log the first live rows so we can see what they mean
+                _state["live_logged"].add(key)
+                if len(_state["live_logged"]) <= 40:
+                    print(f"LIVE ROW: {ln['name']} {ln['stat']} live line {ln['line']:g} | pregame line {prior:g} | "
+                          f"he has {box[ln['norm']].get(ln['stat'])} so far | game {ev['f']:.0%} done | flags {ln['flags']}")
             a = evaluate(ln, ev, box, prior)
             if a and send_alert(ln, ev, a):
                 sent += 1
