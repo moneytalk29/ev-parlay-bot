@@ -1,4 +1,4 @@
-"""Heartbeat: live NFL + NBA game-script scanner for PrizePicks lines. ALERT ONLY, it never places bets.
+"""Heartbeat v1.3: live NFL + NBA game-script scanner for PrizePicks lines. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (same public feed Captain Hook uses) for NFL and NBA player lines.
@@ -8,6 +8,8 @@ What it does
        NFL: a team that trails throws more and runs less; a team that leads runs more and throws less.
        NBA: in a blowout starters sit (fewer minutes); in a tight finish starters play more.
   5. Posts to your Discord webhook when the projection is far enough from PrizePicks' current line.
+     Picks go out as PAIRS (two legs from DIFFERENT games, never the same game, same game-shape preferred) so you can
+     lock both fast. A lone pick waits HB_PAIR_WAIT_SECONDS for a partner, then posts alone, so nothing is lost.
 
 Honest limits (read these)
   - The script adjustments below are STARTING GUESSES, not proven numbers. Every alert is logged so they can be
@@ -43,6 +45,12 @@ COOLDOWN = float(os.getenv("HB_COOLDOWN_MINUTES", "8")) * 60
 MAX_PER_HOUR = int(os.getenv("HB_MAX_ALERTS_PER_HOUR", "20"))
 DISCOVERY_POST = os.getenv("HB_DISCOVERY_POST", "true").lower() == "true"   # post one startup summary of what it can see
 MAX_SUMMARIES = int(os.getenv("HB_MAX_SUMMARIES", "20"))      # box scores read per cycle
+# Pairs: live lines move fast, so picks go out two at a time (PrizePicks needs 2+ legs).
+PAIR_MODE = os.getenv("HB_PAIR_MODE", "true").lower() == "true"
+PAIR_WAIT = float(os.getenv("HB_PAIR_WAIT_SECONDS", "75"))     # how long a lone pick waits for a partner before posting alone
+PAIR_REQUIRE_SAME_SHAPE = os.getenv("HB_PAIR_REQUIRE_SAME_SHAPE", "false").lower() == "true"  # true = only pair lopsided with lopsided, tight with tight
+PAIR_SAME_SHAPE_BONUS = float(os.getenv("HB_PAIR_SAME_SHAPE_BONUS", "0.3"))   # preference for same-shape partners
+LOPSIDED = {"NFL": float(os.getenv("HB_NFL_LOPSIDED", "10")), "NBA": float(os.getenv("HB_NBA_LOPSIDED", "15"))}  # margin that makes a game "lopsided"
 # NFL game-script strength: change in volume per 7 points of margin (a "score"), and the cap
 PASS_TRAIL, PASS_TRAIL_CAP = float(os.getenv("HB_PASS_TRAIL", "0.07")), float(os.getenv("HB_PASS_TRAIL_CAP", "0.30"))
 PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.05")), float(os.getenv("HB_PASS_LEAD_CAP", "0.20"))
@@ -67,24 +75,33 @@ STAT_MAP = {
     "NFL": {"pass yards": ("pass_yds", "pass"), "passing yards": ("pass_yds", "pass"),
             "pass attempts": ("pass_att", "pass"), "pass completions": ("pass_cmp", "pass"),
             "rush yards": ("rush_yds", "rush"), "rushing yards": ("rush_yds", "rush"),
-            "rush attempts": ("rush_att", "rush"), "rushing attempts": ("rush_att", "rush"), "carries": ("rush_att", "rush")},
+            "rush attempts": ("rush_att", "rush"), "rushing attempts": ("rush_att", "rush"), "carries": ("rush_att", "rush"),
+            "receiving yards": ("rec_yds", "rec"), "rec yards": ("rec_yds", "rec"),
+            "receptions": ("rec_cnt", "rec")},
     "NBA": {"points": ("pts", "nba"), "rebounds": ("reb", "nba"), "assists": ("ast", "nba"),
             "3-pt made": ("fg3", "nba"), "3-pointers made": ("fg3", "nba"), "three pointers made": ("fg3", "nba"),
             "3pt made": ("fg3", "nba")},
 }
 STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp": "Pass Completions",
               "rush_yds": "Rush Yards", "rush_att": "Rush Attempts",
+              "rec_yds": "Receiving Yards", "rec_cnt": "Receptions",
               "pts": "Points", "reb": "Rebounds", "ast": "Assists", "fg3": "3-PT Made"}
-MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5,
+MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
                 "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0}
-YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "pass_cmp": 0.9}     # efficiency changes with the script, so shrink these
+YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "rec_yds": 0.8, "pass_cmp": 0.9, "rec_cnt": 0.9}   # efficiency changes with the script, so shrink these
+# v1.3: VOLUME props (attempts, carries, catches) follow the game script more reliably than YARD props (a trailing QB can
+# throw 42 times and still miss his yards). Yard props need a bigger gap to alert, and volume props rank first when pairing.
+YARD_STATS = ("pass_yds", "rec_yds")      # rush yards are NOT here: a leading team runs on purpose, so they follow the script closely
+YARD_EDGE_MULT = float(os.getenv("HB_YARD_EDGE_MULT", "1.3"))
+PRIORITY = {"pass_att": 1.2, "rush_att": 1.15, "rec_cnt": 1.05, "pass_cmp": 1.0,
+            "rush_yds": 1.1, "rec_yds": 0.9, "pass_yds": 0.8}
 BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter", "combo", "+", "(", "longest",
              "fantasy", "first", "last", "total")
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
 _state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {},
-          "live_logged": set()}
+          "live_logged": set(), "pending": {}}
 
 
 # ====================== SMALL HELPERS ======================
@@ -272,6 +289,8 @@ def box_score(sport, event_id):
                         p.update(pass_cmp=cmp_, pass_att=att, pass_yds=_num(row.get("YDS")))
                     elif cname == "rushing":
                         p.update(rush_att=_num(row.get("CAR")), rush_yds=_num(row.get("YDS")))
+                    elif cname == "receiving":
+                        p.update(rec_cnt=_num(row.get("REC")), rec_yds=_num(row.get("YDS")))
                 else:
                     made, _ = _split_pair(row.get("3PT"))
                     p.update(minutes=_num(row.get("MIN")), pts=_num(row.get("PTS")), reb=_num(row.get("REB")),
@@ -293,7 +312,7 @@ def nfl_script(group, stat, margin, f):
     """Volume multiplier for the rest of the game, from the team's score margin (+ = leading)."""
     scale = 0.4 + 0.6 * f                         # an early deficit says less than a late one
     units = abs(margin) / 7.0
-    if group == "pass":
+    if group in ("pass", "rec"):                  # receivers ride the same team passing volume as the QB
         m = (1 + min(PASS_TRAIL_CAP, PASS_TRAIL * units * scale)) if margin < 0 else \
             (1 - min(PASS_LEAD_CAP, PASS_LEAD * units * scale)) if margin > 0 else 1.0
     else:
@@ -373,6 +392,8 @@ def evaluate(line, event, box, prior):
         return None
     gap = proj - L
     need = max(EDGE_PCT * L, MIN_ABS_EDGE.get(line["stat"], 2))
+    if line["stat"] in YARD_STATS:
+        need *= YARD_EDGE_MULT                       # yards are riskier than volume, so ask for a bigger gap
     if abs(gap) < need:
         return None
     if SCRIPT_ONLY and abs(factor - 1) < SCRIPT_MIN:
@@ -382,8 +403,10 @@ def evaluate(line, event, box, prior):
         notes.append(f"PrizePicks line has moved {moved:+g} since pregame (some of the script may already be priced in)")
     if line["live"]:
         notes.append("PrizePicks live line" + (" (rest-of-game, converted to a full-game number)" if LIVE_LINE_MODE == "rest" else ""))
+    shape = "lopsided" if abs(margin) >= LOPSIDED[line["sport"]] else "tight"
     return {"direction": "OVER" if gap > 0 else "UNDER", "proj": proj, "gap": gap, "cur": c, "line": L,
-            "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved}
+            "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved,
+            "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"]}
 
 
 # ====================== ALERTS ======================
@@ -398,27 +421,101 @@ def _can_alert(key, direction):
     return True
 
 
-def send_alert(line, event, a):
-    key = (line["sport"], line["norm"], line["stat"])
-    if not _can_alert(key, a["direction"]):
-        return False
-    _state["alerts"][key] = (time.time(), a["direction"])
-    _state["sent"].append(time.time())
-    emoji = "🔥" if a["direction"] == "OVER" else "🧊"
+def _emoji(a):
+    return "🔥" if a["direction"] == "OVER" else "🧊"
+
+
+def _score_text(event, a):
     t, o = a["team"], a["opp"]
-    score = f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']}"
-    desc = (f"**{line['name']}** — {STAT_LABEL[line['stat']]} **{line['line']:g}**\n"
-            f"Now **{a['cur']:g}** • Projected **{a['proj']:.1f}** • Lean **{a['direction']}** "
-            f"(gap {a['gap']:+.1f})\n"
+    return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • Q{event['period']} {event['clock_txt']}"
+
+
+def _leg_text(line, a):
+    return (f"**{line['name']}** — {STAT_LABEL[line['stat']]} **{line['line']:g}** → **{a['direction']}**\n"
+            f"Now **{a['cur']:g}** • Projected **{a['proj']:.1f}** (gap {a['gap']:+.1f})\n"
             + "\n".join(f"• {n}" for n in a["notes"]))
-    embed = {"title": f"{emoji} Heartbeat — LIVE {line['sport']} — LEAN {a['direction']}",
-             "description": desc, "color": 3066993 if a["direction"] == "OVER" else 3447003,
-             "fields": [{"name": event["name"], "value": f"{score} • Q{event['period']} {event['clock_txt']}", "inline": False}],
-             "footer": {"text": "Model v1 • alert only • projection, not a guarantee"}}
+
+
+def _mark_sent(key, a):
+    _state["alerts"][key] = (time.time(), a["direction"])
+    _state["pending"].pop(key, None)
+
+
+def send_single(cand, label="no pair found"):
+    key, line, event, a = cand
+    _mark_sent(key, a)
+    _state["sent"].append(time.time())
+    footer = "Model v1.3 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    embed = {"title": f"{_emoji(a)} Heartbeat — LIVE {line['sport']} — LEAN {a['direction']}",
+             "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
+             "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
+             "footer": {"text": footer}}
     _post({"embeds": [embed]})
-    print(f"ALERT {line['sport']} {line['name']} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
+    print(f"ALERT(single) {line['sport']} {line['name']} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
           f"{a['direction']} cur {a['cur']} margin {a['margin']} f={event['f']:.2f}")
-    return True
+
+
+def send_pair(c1, c2):
+    fields, legs = [], []
+    for key, line, event, a in (c1, c2):
+        _mark_sent(key, a)
+        fields.append({"name": f"{_emoji(a)} {line['name']} — {STAT_LABEL[line['stat']]} {a['direction']} {line['line']:g}",
+                       "value": f"{_leg_text(line, a)}\n_{event['name']} • {_score_text(event, a)}_"[:1000], "inline": False})
+        legs.append(f"{line['name']} {a['direction']} {line['line']:g}")
+    _state["sent"].append(time.time())
+    same_shape = c1[3]["shape"] == c2[3]["shape"]
+    embed = {"title": "💓 Heartbeat — LIVE PAIR — lock these two",
+             "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape else "") +
+                            ". Lines move fast, so check both are still available before you lock.",
+             "color": 15844367, "fields": fields,
+             "footer": {"text": "Model v1.3 • alert only • projections, not guarantees"}}
+    _post({"embeds": [embed]})
+    print(f"ALERT(pair) {' + '.join(legs)}")
+
+
+def process_candidates(fresh):
+    """fresh = [(key, line, event, alert)] that qualify on THIS cycle's data. Pairs them across different games."""
+    now = time.time()
+    live_keys = {c[0] for c in fresh}
+    for k in list(_state["pending"]):                 # a pick that stopped qualifying is dropped
+        if k not in live_keys:
+            del _state["pending"][k]
+    ready = []
+    for c in fresh:
+        if not _can_alert(c[0], c[3]["direction"]):
+            continue
+        _state["pending"].setdefault(c[0], now)
+        ready.append(c)
+    posted = 0
+    if not PAIR_MODE:
+        for c in ready:
+            send_single(c, label="")
+            posted += 1
+        return posted
+    ready.sort(key=lambda c: -c[3]["strength"])
+    used = set()
+    for i, c1 in enumerate(ready):
+        if c1[0] in used:
+            continue
+        best = None
+        for c2 in ready[i + 1:]:
+            if c2[0] in used or c2[3]["game"] == c1[3]["game"]:      # NEVER two legs from the same game
+                continue
+            same = c1[3]["shape"] == c2[3]["shape"]
+            if PAIR_REQUIRE_SAME_SHAPE and not same:
+                continue
+            score = c2[3]["strength"] + (PAIR_SAME_SHAPE_BONUS if same else 0.0)
+            if best is None or score > best[0]:
+                best = (score, c2)
+        if best:
+            send_pair(c1, best[1])
+            used |= {c1[0], best[1][0]}
+            posted += 1
+    for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
+        if c[0] not in used and now - _state["pending"].get(c[0], now) >= PAIR_WAIT:
+            send_single(c)
+            posted += 1
+    return posted
 
 
 def discovery_report(board, live):
@@ -479,6 +576,7 @@ def cycle(first=False):
         discovery_report(board, live)
     # 3) project every tracked line that belongs to a live game
     sent = checked = 0
+    fresh = []
     for key, ln in board.items():
         sport = ln["sport"]
         for ev in live.get(sport, []):
@@ -497,9 +595,10 @@ def cycle(first=False):
                     print(f"LIVE ROW: {ln['name']} {ln['stat']} live line {ln['line']:g} | pregame line {prior:g} | "
                           f"he has {box[ln['norm']].get(ln['stat'])} so far | game {ev['f']:.0%} done | flags {ln['flags']}")
             a = evaluate(ln, ev, box, prior)
-            if a and send_alert(ln, ev, a):
-                sent += 1
+            if a:
+                fresh.append((key, ln, ev, a))
             break
+    sent = process_candidates(fresh)
     n_live = sum(len(v) for v in live.values())
     if n_live or first:
         print(f"cycle: {n_live} live games, {len(board)} lines tracked, {checked} projected, {sent} alerts")
