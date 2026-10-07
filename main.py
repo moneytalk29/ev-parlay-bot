@@ -89,7 +89,7 @@ STAT_MAP = {
             "receptions": ("rec_cnt", "rec")},
     "NBA": {"points": ("pts", "nba"), "rebounds": ("reb", "nba"), "assists": ("ast", "nba"),
             "3-pt made": ("fg3", "nba"), "3-pointers made": ("fg3", "nba"), "three pointers made": ("fg3", "nba"),
-            "3pt made": ("fg3", "nba"),
+            "3pt made": ("fg3", "nba"), "3ptm": ("fg3", "nba"), "3pm": ("fg3", "nba"),
             "pts+rebs+asts": ("pra", "nba"), "points+rebounds+assists": ("pra", "nba"), "pra": ("pra", "nba"),
             "fantasy score": ("fant", "nba"), "fantasy points": ("fant", "nba")},
 }
