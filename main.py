@@ -611,8 +611,8 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
-    embed = {"title": f"{_emoji(a)} Heartbeat — LIVE {line['sport']} — LEAN {a['direction']}",
+    footer = "Model v1.5 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{' LIVE' if line['live'] else ''} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
              "footer": {"text": footer}}
@@ -630,11 +630,11 @@ def send_pair(c1, c2):
         legs.append(f"{line['name']} {a['direction']} {line['line']:g}")
     _state["sent"].append(time.time())
     same_shape = c1[3]["shape"] == c2[3]["shape"]
-    embed = {"title": "💓 Heartbeat — LIVE PAIR — lock these two",
+    embed = {"title": "💓 Heartbeat — " + ("LIVE " if (c1[1]["live"] or c2[1]["live"]) else "") + "PAIR — lock these two",
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.4 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.5 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
