@@ -1,7 +1,7 @@
-"""Heartbeat v1.4: live NFL + NBA game-script scanner for PrizePicks lines. ALERT ONLY, it never places bets.
+"""Heartbeat v1.6: live NFL + NBA game-script scanner for PrizePicks lines. ALERT ONLY, it never places bets.
 
 What it does
-  1. Reads the PrizePicks board (same public feed Captain Hook uses) for NFL and NBA player lines.
+  1. Reads the PrizePicks board (PrizePicks' public feed) for NFL and NBA player lines.
   2. Remembers each line from BEFORE kickoff (the "pregame line"), which is the market's expectation for the player.
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
@@ -72,6 +72,13 @@ FANT = tuple(float(x) for x in os.getenv("HB_FANT_WEIGHTS", "1,1.2,1.5,3,3,-1").
 # The first live game will show which one it is (see the "LIVE ROW" log lines). Change this if it turns out to be "rest".
 LIVE_LINE_MODE = os.getenv("HB_LIVE_LINE_MODE", "full").lower()
 
+# Tennis (v1.6): DISCOVERY ONLY. Off by default. When on, the bot only LOGS what PrizePicks and ESPN show for tennis. It sends no tennis picks.
+TENNIS_DISCOVERY = os.getenv("HB_TENNIS_DISCOVERY", "false").lower() == "true"
+TENNIS_POST = os.getenv("HB_TENNIS_POST", "false").lower() == "true"     # false = tennis discovery writes to the logs only, nothing goes to Discord
+TENNIS_POLL = float(os.getenv("HB_TENNIS_POLL_SECONDS", "60"))
+TENNIS_ESPN = {"ATP": "https://site.api.espn.com/apis/site/v2/sports/tennis/atp",
+               "WTA": "https://site.api.espn.com/apis/site/v2/sports/tennis/wta"}
+
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
            "Origin": "https://app.prizepicks.com", "Referer": "https://app.prizepicks.com/"}
 ESPN = {"NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl",
@@ -113,7 +120,8 @@ BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter"
 _session = requests.Session()
 _session.headers.update(HEADERS)
 _state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {},
-          "live_logged": set(), "pending": {}, "snap": {}, "names": {}, "names_printed": 0}
+          "live_logged": set(), "pending": {}, "snap": {}, "names": {}, "names_printed": 0,
+          "tennis": {"last": 0.0, "pp_sig": None, "matches": set(), "posts": 0}}
 
 
 # ====================== SMALL HELPERS ======================
@@ -611,7 +619,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.5 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.6 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{' LIVE' if line['live'] else ''} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
@@ -634,7 +642,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.5 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.6 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -714,6 +722,7 @@ def discovery_report(board, live):
              f"Live games right now: {sum(len(v) for v in live.values())}",
              f"PrizePicks attribute names seen: {', '.join(sorted(_state['keys_seen'])) or 'none yet'}",
              f"Status/odds flags seen: {flags or 'none'}"]
+    lines.append("Tennis discovery: " + ("ON (logging only, no tennis picks)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
     nm = sorted(_state["names"].get("NBA", set()))
@@ -723,6 +732,113 @@ def discovery_report(board, live):
     if DISCOVERY_POST:
         _post({"embeds": [{"title": "💓 Heartbeat online", "description": "\n".join(f"• {x}" for x in lines),
                            "color": 3066993}]})
+
+
+# ====================== TENNIS DISCOVERY (v1.6) ======================
+def _tennis_pp_summary(raw):
+    """PrizePicks tennis lines: how many, which stat names, a few examples."""
+    players, leagues = {}, {}
+    for inc in raw.get("included", []):
+        a = inc.get("attributes", {})
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = a.get("name", "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    names, who, rows = {}, set(), []
+    for item in raw.get("data", []):
+        try:
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            if "TENNIS" not in lg and lg not in ("ATP", "WTA"):
+                continue
+            stat = str(a.get("stat_display_name") or a.get("stat_type") or "").strip()
+            nm = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
+            names[stat] = names.get(stat, 0) + 1
+            who.add(nm)
+            if len(rows) < 6 and stat not in [r[1] for r in rows]:
+                rows.append((nm, stat, a.get("line_score"), a.get("odds_type")))
+        except Exception:
+            continue
+    return names, who, rows
+
+
+def _tennis_matches(base):
+    """Every match on ESPN's scoreboard for one tour, as simple dicts."""
+    data = _get_json(base + "/scoreboard")
+    out = []
+    for ev in data.get("events", []) or []:
+        comps = list(ev.get("competitions") or [])
+        for g in ev.get("groupings") or []:
+            comps += g.get("competitions") or []
+        for c in comps:
+            st = ((c.get("status") or {}).get("type") or {})
+            names, sets = [], []
+            for p in c.get("competitors") or []:
+                names.append((p.get("athlete") or {}).get("displayName") or p.get("displayName") or "?")
+                sets.append([int(_num(x.get("value"))) for x in (p.get("linescores") or [])])
+            out.append({"id": str(c.get("id") or ev.get("id") or ""), "tournament": ev.get("name") or "", "state": st.get("state") or "",
+                        "detail": st.get("detail") or st.get("shortDetail") or "", "names": names, "sets": sets, "raw": c})
+    return out
+
+
+def tennis_discovery(raw):
+    """Logs (and posts a short note to Discord) what tennis data exists. Sends NO picks. Never raises."""
+    t = _state["tennis"]
+    if time.time() - t["last"] < TENNIS_POLL:
+        return
+    t["last"] = time.time()
+    # 1) PrizePicks tennis board
+    try:
+        names, who, rows = _tennis_pp_summary(raw)
+        sig = tuple(sorted(names))
+        if sig != t["pp_sig"]:
+            t["pp_sig"] = sig
+            line = "; ".join(f"{k} x{v}" for k, v in sorted(names.items()))
+            ex = " | ".join(f"{r[0]} {r[1]} {r[2]} ({r[3]})" for r in rows)
+            print(f"TENNIS BOARD: {len(who)} players. Stats: {line or 'none on the board right now'}")
+            if ex:
+                print("TENNIS EXAMPLES:", ex)
+            if TENNIS_POST and DISCOVERY_POST and t["posts"] < 4:
+                t["posts"] += 1
+                _post({"embeds": [{"title": "🎾 Heartbeat — tennis discovery (no picks)", "color": 3066993,
+                                   "description": f"• PrizePicks tennis: {len(who)} players\n• Stat names: {line or 'none on the board right now'}"[:1500]
+                                                  + (f"\n• Examples: {ex}"[:600] if ex else "")}]})
+    except Exception as e:
+        print("tennis board error:", e)
+    # 2) ESPN live tennis
+    for tour, base in TENNIS_ESPN.items():
+        try:
+            ms = _tennis_matches(base)
+        except Exception as e:
+            print(f"tennis ESPN error ({tour}):", e)
+            continue
+        live = [m for m in ms if m["state"] == "in"]
+        print(f"TENNIS ESPN {tour}: {len(ms)} matches on the scoreboard, {len(live)} live")
+        for m in live[:3]:
+            if m["id"] in t["matches"] or len(t["matches"]) >= 6:
+                continue
+            t["matches"].add(m["id"])
+            score = " vs ".join(f"{n} {'-'.join(str(x) for x in sx)}" for n, sx in zip(m["names"], m["sets"]))
+            print(f"TENNIS LIVE MATCH ({tour}): {m['tournament']} | {score} | {m['detail']}")
+            print("TENNIS MATCH KEYS:", sorted(m["raw"].keys()))
+            comp0 = (m["raw"].get("competitors") or [{}])[0]
+            print("TENNIS PLAYER KEYS:", sorted(comp0.keys()))
+            print("TENNIS PLAYER STATS:", str(comp0.get("statistics"))[:600])
+            extra = ""
+            try:                                           # does ESPN give a per-match summary with player stats?
+                sm = _get_json(f"{base}/summary?event={m['id']}")
+                extra = f"summary keys: {sorted(sm.keys())}"
+                print("TENNIS SUMMARY KEYS:", sorted(sm.keys()))
+                print("TENNIS SUMMARY STATS:", str(sm.get("boxscore") or sm.get("statistics"))[:600])
+            except Exception as e:
+                extra = "no match summary"
+                print("TENNIS SUMMARY: none (", e, ")")
+            if TENNIS_POST and DISCOVERY_POST and t["posts"] < 4:
+                t["posts"] += 1
+                _post({"embeds": [{"title": "🎾 Heartbeat — live tennis seen (no picks)", "color": 3447003,
+                                   "description": f"• {tour}: {m['tournament']}\n• {score}\n• {m['detail']}\n• Per-player stats on the match: "
+                                                  f"{'yes' if comp0.get('statistics') else 'not on the scoreboard'}\n• {extra}"[:1500]}]})
 
 
 # ====================== MAIN LOOP ======================
@@ -739,11 +855,17 @@ def update_priors(board, live_names):
 def cycle(first=False):
     # 1) PrizePicks
     try:
-        board = parse_board(fetch_board())
+        raw = fetch_board()
+        board = parse_board(raw)
     except Exception as e:
         print("PrizePicks error:", e)
         return
     _state["board"] = board
+    if TENNIS_DISCOVERY:
+        try:
+            tennis_discovery(raw)
+        except Exception as e:                      # tennis can never stop NBA/NFL
+            print("tennis error:", e)
     # 2) ESPN live games + box scores
     live, boxes, live_names = {}, {}, {}
     budget = MAX_SUMMARIES
