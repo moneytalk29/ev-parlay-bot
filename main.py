@@ -1,4 +1,4 @@
-"""Heartbeat v1.8: live NFL + NBA + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -9,6 +9,9 @@ What it does
        NBA: in a blowout starters sit (fewer minutes); in a tight finish starters play more.
             v1.4 adds 1st-half / 2nd-half props (1H and 2H points, rebounds, assists, PRA, fantasy score) and full-game
             PRA / fantasy score. 2H props are judged at HALFTIME using the score, first-half minutes and foul trouble.
+       NHL (v1.9): "score effects": a team that trails shoots more and the leading team blocks more, so the trailing
+            team's skaters get more Shots On Goal and the leading team's goalie faces more shots (more Saves).
+            Props: Shots On Goal, Goalie Saves, Blocked Shots, Hits (hits only alert when HB_SCRIPT_ONLY=false).
        TENNIS (v1.7): ESPN gives the live games score of every set (no aces or double faults), so the bot plays out the
             rest of the match a couple of thousand times from the current score and counts how often each line goes
             over or under. Props: Total Games, Total Games Won, Total Sets, Total Tie Breaks, 1st Set Total Games and
@@ -51,7 +54,7 @@ import requests
 
 # ====================== SETTINGS (Railway variables) ======================
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA").split(",") if s.strip()]
+SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA,NHL").split(",") if s.strip()]
 PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
 PP_POLL = float(os.getenv("HB_PP_POLL_SECONDS", "30"))        # how often to re-read PrizePicks
 ESPN_POLL = float(os.getenv("HB_ESPN_POLL_SECONDS", "30"))    # how often to re-read live scores/box scores
@@ -71,12 +74,16 @@ PAIR_MODE = os.getenv("HB_PAIR_MODE", "true").lower() == "true"
 PAIR_WAIT = float(os.getenv("HB_PAIR_WAIT_SECONDS", "75"))     # how long a lone pick waits for a partner before posting alone
 PAIR_REQUIRE_SAME_SHAPE = os.getenv("HB_PAIR_REQUIRE_SAME_SHAPE", "false").lower() == "true"  # true = only pair lopsided with lopsided, tight with tight
 PAIR_SAME_SHAPE_BONUS = float(os.getenv("HB_PAIR_SAME_SHAPE_BONUS", "0.3"))   # preference for same-shape partners
-LOPSIDED = {"NFL": float(os.getenv("HB_NFL_LOPSIDED", "10")), "NBA": float(os.getenv("HB_NBA_LOPSIDED", "15"))}  # margin that makes a game "lopsided"
+LOPSIDED = {"NFL": float(os.getenv("HB_NFL_LOPSIDED", "10")), "NBA": float(os.getenv("HB_NBA_LOPSIDED", "15")),
+            "NHL": float(os.getenv("HB_NHL_LOPSIDED", "2"))}  # margin that makes a game "lopsided"
 # NFL game-script strength: change in volume per 7 points of margin (a "score"), and the cap
 PASS_TRAIL, PASS_TRAIL_CAP = float(os.getenv("HB_PASS_TRAIL", "0.07")), float(os.getenv("HB_PASS_TRAIL_CAP", "0.30"))
 PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.05")), float(os.getenv("HB_PASS_LEAD_CAP", "0.20"))
 RUSH_LEAD, RUSH_LEAD_CAP = float(os.getenv("HB_RUSH_LEAD", "0.08")), float(os.getenv("HB_RUSH_LEAD_CAP", "0.30"))
 RUSH_TRAIL, RUSH_TRAIL_CAP = float(os.getenv("HB_RUSH_TRAIL", "0.09")), float(os.getenv("HB_RUSH_TRAIL_CAP", "0.35"))
+# NHL (v1.9) score effects: change in the rest-of-game rate per goal of margin, and the cap
+NHL_TRAIL, NHL_TRAIL_CAP = float(os.getenv("HB_NHL_TRAIL", "0.08")), float(os.getenv("HB_NHL_TRAIL_CAP", "0.25"))
+NHL_LEAD, NHL_LEAD_CAP = float(os.getenv("HB_NHL_LEAD", "0.06")), float(os.getenv("HB_NHL_LEAD_CAP", "0.20"))
 # NBA
 NBA_EXPECTED_MIN = float(os.getenv("HB_NBA_EXPECTED_MIN", "32"))   # a typical starter's minutes
 NBA_BLOWOUT = float(os.getenv("HB_NBA_BLOWOUT", "20"))             # point gap where starters start to sit (3rd/4th quarter)
@@ -118,9 +125,11 @@ TENNIS_ESPN = {"ATP": "https://site.api.espn.com/apis/site/v2/sports/tennis/atp"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
            "Origin": "https://app.prizepicks.com", "Referer": "https://app.prizepicks.com/"}
 ESPN = {"NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl",
-        "NBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"}
-GAME_SECONDS = {"NFL": 3600.0, "NBA": 2880.0}
-PERIOD_SECONDS = {"NFL": 900.0, "NBA": 720.0}
+        "NBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba",
+        "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl"}
+GAME_SECONDS = {"NFL": 3600.0, "NBA": 2880.0, "NHL": 3600.0}
+PERIOD_SECONDS = {"NFL": 900.0, "NBA": 720.0, "NHL": 1200.0}
+LAST_PERIOD = {"NFL": 4, "NBA": 4, "NHL": 3}     # overtime is skipped
 
 # PrizePicks stat name (lowercase) -> (stat key, group)
 STAT_MAP = {
@@ -137,6 +146,9 @@ STAT_MAP = {
             "fantasy score": ("fant", "nba"), "fantasy points": ("fant", "nba"),
             "pts+rebs": ("pr", "nba"), "points+rebounds": ("pr", "nba"), "pts+asts": ("pa", "nba"),
             "points+assists": ("pa", "nba"), "rebs+asts": ("ra", "nba"), "rebounds+assists": ("ra", "nba")},
+    "NHL": {"shots on goal": ("sog", "shots"), "shots": ("sog", "shots"), "sog": ("sog", "shots"),
+            "goalie saves": ("saves", "goalie"), "saves": ("saves", "goalie"),
+            "blocked shots": ("nhl_blk", "def"), "hits": ("hits", "hits")},
 }
 # PrizePicks tennis stat name (lowercase) -> stat key. Aces, double faults and break points are left out on purpose.
 TENNIS_STATS = {"total games": "t_games", "total games won": "t_gw", "total sets": "t_sets",
@@ -151,16 +163,18 @@ STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp":
               "pra": "Pts+Rebs+Asts", "fant": "Fantasy Score", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts",
               "t_games": "Total Games", "t_gw": "Total Games Won", "t_sets": "Total Sets", "t_tb": "Total Tie Breaks",
               "t_set1": "1st Set Total Games", "t_fant": "Fantasy Score",
-              "t_aces": "Aces", "t_df": "Double Faults"}
+              "t_aces": "Aces", "t_df": "Double Faults",
+              "sog": "Shots On Goal", "saves": "Goalie Saves", "nhl_blk": "Blocked Shots", "hits": "Hits"}
 MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
-                "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0, "pr": 3.0, "pa": 3.0, "ra": 2.0}
+                "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0, "pr": 3.0, "pa": 3.0, "ra": 2.0,
+                "sog": 1.0, "saves": 3.0, "nhl_blk": 1.0, "hits": 1.0}
 YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "rec_yds": 0.8, "pass_cmp": 0.9, "rec_cnt": 0.9}   # efficiency changes with the script, so shrink these
 # v1.3: VOLUME props (attempts, carries, catches) follow the game script more reliably than YARD props (a trailing QB can
 # throw 42 times and still miss his yards). Yard props need a bigger gap to alert, and volume props rank first when pairing.
 YARD_STATS = ("pass_yds", "rec_yds")      # rush yards are NOT here: a leading team runs on purpose, so they follow the script closely
 YARD_EDGE_MULT = float(os.getenv("HB_YARD_EDGE_MULT", "1.3"))
 PRIORITY = {"pass_att": 1.2, "rush_att": 1.15, "rec_cnt": 1.05, "pass_cmp": 1.0,
-            "rush_yds": 1.1, "rec_yds": 0.9, "pass_yds": 0.8, "fant": 0.95}
+            "rush_yds": 1.1, "rec_yds": 0.9, "pass_yds": 0.8, "fant": 0.95, "sog": 1.1, "saves": 1.05}
 BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter", "combo", "+", "(", "longest",
              "fantasy", "first", "last", "total")
 
@@ -427,7 +441,7 @@ def live_events(sport):
         period = int(st.get("period") or 0)
         clock = _clock_seconds(st.get("displayClock"))
         total, per = GAME_SECONDS[sport], PERIOD_SECONDS[sport]
-        if period < 1 or period > 4 or len(teams) != 2:
+        if period < 1 or period > LAST_PERIOD[sport] or len(teams) != 2:
             continue                                   # overtime or odd data: skip
         elapsed = (period - 1) * per + (per - min(clock, per))
         tname = str((st.get("type") or {}).get("name") or "")
@@ -449,6 +463,8 @@ def box_score(sport, event_id):
         tid = str((team.get("team") or {}).get("id"))
         for cat in team.get("statistics", []):
             labels = cat.get("labels") or []
+            if sport == "NHL":
+                labels = cat.get("keys") or labels           # NHL labels are ambiguous ("SOG" = shootout goals), keys are not
             cname = (cat.get("name") or "").lower()
             for ath in cat.get("athletes", []):
                 nm = _norm((ath.get("athlete") or {}).get("displayName", ""))
@@ -457,7 +473,15 @@ def box_score(sport, event_id):
                     continue
                 row = dict(zip(labels, vals))
                 p = res.setdefault(nm, {"team_id": tid})
-                if sport == "NFL":
+                if sport == "NHL":
+                    if cname == "goalies":
+                        p.update(saves=_num(row.get("saves")), goals_against=_num(row.get("goalsAgainst")),
+                                 g_toi=_clock_seconds(row.get("timeOnIce")) / 60.0, goalie=True)
+                    else:
+                        p.update(sog=_num(row.get("shotsTotal")), nhl_blk=_num(row.get("blockedShots")),
+                                 hits=_num(row.get("hits")), goals=_num(row.get("goals")), assists=_num(row.get("assists")),
+                                 toi=_clock_seconds(row.get("timeOnIce")) / 60.0)
+                elif sport == "NFL":
                     if cname == "passing":
                         cmp_, att = _split_pair(row.get("C/ATT"))
                         p.update(pass_cmp=cmp_, pass_att=att, pass_yds=_num(row.get("YDS")))
@@ -509,6 +533,46 @@ def project_nfl(line, cur, prior, f, margin):
              + (f" by {abs(margin)}" if margin else "") + ")"]
     if margin >= 21 and f >= 0.7:
         notes.append("⚠️ Big lead late: starters may sit, which supports unders")
+    return proj, m, notes
+
+
+def nhl_script(group, margin, f):
+    """Rest-of-game multiplier from the team's goal margin (+ = leading). Score effects grow as the game goes on."""
+    scale = 0.5 + 0.5 * f
+    u = min(abs(margin), 3)
+    up_trail = 1 + min(NHL_TRAIL_CAP, NHL_TRAIL * u * scale)
+    down_lead = 1 - min(NHL_LEAD_CAP, NHL_LEAD * u * scale)
+    if margin == 0 or group == "hits":
+        return 1.0
+    if group == "shots":                              # trailing team presses and shoots more
+        return up_trail if margin < 0 else down_lead
+    if group == "goalie":                             # his team leads -> the other team presses -> more shots at him
+        return up_trail if margin > 0 else down_lead
+    if group == "def":                                # leading team sits back and blocks more shots
+        return (1 + min(NHL_LEAD_CAP, NHL_LEAD * u * scale)) if margin > 0 else (1 - min(NHL_LEAD_CAP, NHL_LEAD * u * scale))
+    return 1.0
+
+
+def project_nhl(line, cur, prior, f, margin):
+    """Returns (projection, script factor, notes) or None when the goalie isn't the one in net."""
+    if line["group"] == "goalie":
+        if not cur.get("goalie"):
+            return None
+        if cur.get("g_toi", 0.0) < f * 60.0 - 3.0:
+            return None                               # pulled, or came in late: he isn't the starter in net
+    c = cur.get(line["stat"], 0.0)
+    total = _blend_total(prior, c, f)
+    m = nhl_script(line["group"], margin, f)
+    proj = c + total * (1 - f) * m
+    lead_txt = "leads" if margin > 0 else "trails" if margin < 0 else "tied"
+    notes = [f"Pace baseline {total:.1f} for the full game (pregame line {prior:g})",
+             f"Score effect ×{m:.2f} on the rest of the game (team {lead_txt}" + (f" by {abs(margin)}" if margin else "") + ")"]
+    if line["group"] == "shots" and margin < 0 and f >= 0.85:
+        notes.append("Trailing late: the goalie may be pulled for an extra attacker (more shots)")
+    if line["group"] == "goalie" and margin < 0 and f >= 0.85:
+        notes.append("⚠️ His team trails late: he may be pulled for an extra attacker (fewer saves)")
+    if line["group"] == "goalie" and abs(margin) >= 4:
+        notes.append("⚠️ Lopsided game: a goalie can get pulled")
     return proj, m, notes
 
 
@@ -652,6 +716,11 @@ def evaluate(line, event, box, prior):
     if res is None:
         if line["sport"] == "NFL":
             proj, factor, notes = project_nfl(line, cur, prior, f, margin)
+        elif line["sport"] == "NHL":
+            res_nhl = project_nhl(line, cur, prior, f, margin)
+            if not res_nhl:
+                return None
+            proj, factor, notes = res_nhl
         else:
             if cur.get("minutes", 0) <= 0:
                 return None
@@ -679,7 +748,8 @@ def evaluate(line, event, box, prior):
     shape = "lopsided" if abs(margin) >= LOPSIDED[line["sport"]] else "tight"
     return {"direction": "OVER" if gap > 0 else "UNDER", "proj": proj, "gap": gap, "cur": c, "line": L,
             "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved,
-            "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"]}
+            "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"],
+            "sport": line["sport"]}
 
 
 # ====================== TENNIS (v1.7) ======================
@@ -1108,7 +1178,7 @@ def _score_text(event, a):
     if a.get("score_txt"):
         return a["score_txt"]
     t, o = a["team"], a["opp"]
-    return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • Q{event['period']} {event['clock_txt']}"
+    return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • {'P' if a.get('sport') == 'NHL' else 'Q'}{event['period']} {event['clock_txt']}"
 
 
 def _leg_text(line, a):
@@ -1133,7 +1203,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.8 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1159,7 +1229,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.8 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1244,9 +1314,10 @@ def get_prior(key, ln):
 def discovery_report(board, live):
     nfl = sum(1 for k in board if k[0] == "NFL")
     nba = sum(1 for k in board if k[0] == "NBA")
+    nhl = sum(1 for k in board if k[0] == "NHL")
     flags = {k: sorted(v)[:6] for k, v in _state["flags_seen"].items()}
     lines = [f"Sports tracked: {', '.join(SPORTS)}" + (", TENNIS" if TENNIS_ON else ""),
-             f"PrizePicks lines I can model right now: NFL {nfl}, NBA {nba}"
+             f"PrizePicks lines I can model right now: NFL {nfl}, NBA {nba}, NHL {nhl}"
              + (f", tennis {len(_state['tboard'])}" if TENNIS_ON else ""),
              f"Live games right now: {sum(len(v) for v in live.values())}",
              f"PrizePicks attribute names seen: {', '.join(sorted(_state['keys_seen'])) or 'none yet'}",
@@ -1478,7 +1549,7 @@ def cycle(first=False):
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat v1.8 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
