@@ -1,7 +1,7 @@
-"""Heartbeat v1.6: live NFL + NBA game-script scanner for PrizePicks lines. ALERT ONLY, it never places bets.
+"""Heartbeat v1.7: live NFL + NBA + TENNIS scanner for PrizePicks lines. ALERT ONLY, it never places bets.
 
 What it does
-  1. Reads the PrizePicks board (PrizePicks' public feed) for NFL and NBA player lines.
+  1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
   2. Remembers each line from BEFORE kickoff (the "pregame line"), which is the market's expectation for the player.
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
@@ -9,6 +9,11 @@ What it does
        NBA: in a blowout starters sit (fewer minutes); in a tight finish starters play more.
             v1.4 adds 1st-half / 2nd-half props (1H and 2H points, rebounds, assists, PRA, fantasy score) and full-game
             PRA / fantasy score. 2H props are judged at HALFTIME using the score, first-half minutes and foul trouble.
+       TENNIS (v1.7): ESPN gives the live games score of every set (no aces or double faults), so the bot plays out the
+            rest of the match a couple of thousand times from the current score and counts how often each line goes
+            over or under. Props: Total Games, Total Games Won, Total Sets, Total Tie Breaks, 1st Set Total Games and
+            Fantasy Score. Aces, Double Faults and Break Points Won are skipped (no free live data).
+            Only juicy picks post: the over or under must hit in at least HB_TENNIS_MIN_PROB (70%) of the simulations.
   5. Posts to your Discord webhook when the projection is far enough from PrizePicks' current line.
      Picks go out as PAIRS (two legs from DIFFERENT games, never the same game, same game-shape preferred) so you can
      lock both fast. A lone pick waits HB_PAIR_WAIT_SECONDS for a partner, then posts alone, so nothing is lost.
@@ -20,9 +25,12 @@ Honest limits (read these)
   - It needs the pregame line saved BEFORE kickoff. If the service restarts during a game, lines for that
     game have no saved prior and are skipped (set HB_ALLOW_NO_PRIOR=true to override, at lower trust).
   - It does not know about injuries, a backup QB coming in, or weather.
+  - Tennis: it does not know who is serving, and it assumes best-of-3 sets (men's Grand Slams are best-of-5:
+    set HB_TENNIS_BEST_OF=5 for those weeks). If a player retires, PrizePicks keeps the stats so far (risk for overs).
 Everything is a Railway variable. Only WEBHOOK_URL is required.
 """
 import os
+import random
 import re
 import time
 import unicodedata
@@ -72,7 +80,18 @@ FANT = tuple(float(x) for x in os.getenv("HB_FANT_WEIGHTS", "1,1.2,1.5,3,3,-1").
 # The first live game will show which one it is (see the "LIVE ROW" log lines). Change this if it turns out to be "rest".
 LIVE_LINE_MODE = os.getenv("HB_LIVE_LINE_MODE", "full").lower()
 
-# Tennis (v1.6): DISCOVERY ONLY. Off by default. When on, the bot only LOGS what PrizePicks and ESPN show for tennis. It sends no tennis picks.
+# Tennis alerts (v1.7): ON by default. HB_TENNIS=false turns them off.
+TENNIS_ON = os.getenv("HB_TENNIS", "true").lower() == "true"
+T_MIN_PROB = float(os.getenv("HB_TENNIS_MIN_PROB", "0.70"))        # "juicy": the pick must hit in 70%+ of simulated finishes
+T_FANT_EXTRA = float(os.getenv("HB_TENNIS_FANT_EXTRA", "0.05"))    # Fantasy Score needs 5% more (aces/double faults aren't in the live data)
+T_MIN_GAMES = int(os.getenv("HB_TENNIS_MIN_GAMES", "4"))           # wait until at least 4 games are played
+T_SIMS = int(os.getenv("HB_TENNIS_SIMS", "2000"))                  # simulated finishes per match
+T_BEST_OF = int(os.getenv("HB_TENNIS_BEST_OF", "3"))               # sets in a match (5 only for men's Grand Slams)
+T_HOLD = {"ATP": float(os.getenv("HB_TENNIS_HOLD_ATP", "0.80")),   # how often a server holds (used when there is no Total Games line)
+          "WTA": float(os.getenv("HB_TENNIS_HOLD_WTA", "0.66"))}
+T_SERVE_ADJ = float(os.getenv("HB_TENNIS_SERVE_ADJ", "0"))         # expected fantasy points from aces minus double faults
+T_PRIOR_GAMES = float(os.getenv("HB_TENNIS_PRIOR_GAMES", "14"))    # how many games it takes before the live score outweighs the pregame lines
+# Tennis discovery (v1.6): logs only. Not needed any more now that tennis alerts exist; leave it off to keep the logs short.
 TENNIS_DISCOVERY = os.getenv("HB_TENNIS_DISCOVERY", "false").lower() == "true"
 TENNIS_POST = os.getenv("HB_TENNIS_POST", "false").lower() == "true"     # false = tennis discovery writes to the logs only, nothing goes to Discord
 TENNIS_POLL = float(os.getenv("HB_TENNIS_POLL_SECONDS", "60"))
@@ -100,11 +119,18 @@ STAT_MAP = {
             "pts+rebs+asts": ("pra", "nba"), "points+rebounds+assists": ("pra", "nba"), "pra": ("pra", "nba"),
             "fantasy score": ("fant", "nba"), "fantasy points": ("fant", "nba")},
 }
+# PrizePicks tennis stat name (lowercase) -> stat key. Aces, double faults and break points are left out on purpose.
+TENNIS_STATS = {"total games": "t_games", "total games won": "t_gw", "total sets": "t_sets",
+                "total tie breaks": "t_tb", "total tiebreaks": "t_tb", "1st set total games": "t_set1",
+                "fantasy score": "t_fant"}
+T_MATCH_LEVEL = ("t_games", "t_sets", "t_tb", "t_set1")    # same number for both players: alert once per match
 STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp": "Pass Completions",
               "rush_yds": "Rush Yards", "rush_att": "Rush Attempts",
               "rec_yds": "Receiving Yards", "rec_cnt": "Receptions",
               "pts": "Points", "reb": "Rebounds", "ast": "Assists", "fg3": "3-PT Made",
-              "pra": "Pts+Rebs+Asts", "fant": "Fantasy Score"}
+              "pra": "Pts+Rebs+Asts", "fant": "Fantasy Score",
+              "t_games": "Total Games", "t_gw": "Total Games Won", "t_sets": "Total Sets", "t_tb": "Total Tie Breaks",
+              "t_set1": "1st Set Total Games", "t_fant": "Fantasy Score"}
 MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
                 "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0}
 YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "rec_yds": 0.8, "pass_cmp": 0.9, "rec_cnt": 0.9}   # efficiency changes with the script, so shrink these
@@ -119,8 +145,10 @@ BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter"
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
+_rng = random.Random()
 _state = {"prior": {}, "alerts": {}, "sent": [], "summ": {}, "board": {}, "keys_seen": set(), "flags_seen": {},
           "live_logged": set(), "pending": {}, "snap": {}, "names": {}, "names_printed": 0,
+          "tboard": {}, "tcal": {}, "tlive": 0.0, "t_logged": set(),
           "tennis": {"last": 0.0, "pp_sig": None, "matches": set(), "posts": 0}}
 
 
@@ -301,6 +329,55 @@ def parse_board(data):
         except Exception:
             continue
     _state["keys_seen"] |= seen_keys
+    return out
+
+
+def _is_tennis_league(lg):
+    return "TENNIS" in lg or lg in ("ATP", "WTA")
+
+
+def parse_tennis(data):
+    """Tennis lines we can model: {("TENNIS", norm_name, stat, None): line dict}. Standard lines only."""
+    players, leagues, games = {}, {}, {}
+    for inc in data.get("included", []):
+        a = inc.get("attributes", {})
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = a.get("name", "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+        elif inc.get("type") == "game":
+            games[inc["id"]] = a
+    out = {}
+    for item in data.get("data", []):
+        try:
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            if not _is_tennis_league(lg):
+                continue
+            stat_name = re.sub(r"\s+", " ", str(a.get("stat_display_name") or a.get("stat_type") or "").lower()).strip()
+            _state["names"].setdefault("TENNIS", set()).add(stat_name)
+            stat = TENNIS_STATS.get(stat_name)
+            if not stat:
+                continue
+            if str(a.get("odds_type") or "standard").lower() != "standard":
+                continue
+            name = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
+            if not name:
+                continue
+            gid = (rel.get("game", {}).get("data") or {}).get("id")
+            start = a.get("start_time") or (games.get(gid) or {}).get("start_time") or ""
+            flags = {k: a.get(k) for k in ("status", "is_live", "in_game", "odds_type") if k in a}
+            live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
+                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress"))
+            key = ("TENNIS", _norm(name), stat, None)
+            if key in out and out[key]["live"] and not live_row:
+                continue
+            out[key] = {"sport": "TENNIS", "name": name, "norm": _norm(name), "team": "", "pos": "",
+                        "stat": stat, "group": "tennis", "half": None, "line": _num(a.get("line_score")),
+                        "start": _to_dt(start), "opp": a.get("description") or "", "flags": flags, "live": live_row}
+        except Exception:
+            continue
     return out
 
 
@@ -583,14 +660,265 @@ def evaluate(line, event, box, prior):
             "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"]}
 
 
+# ====================== TENNIS (v1.7) ======================
+def _set_over(x, y):
+    """A set is finished at 6+ games with a 2-game lead, or 7-6 after a tiebreak."""
+    hi, lo = max(x, y), min(x, y)
+    return (hi >= 6 and hi - lo >= 2) or (hi == 7 and lo == 6)
+
+
+def _cl(x, lo=0.3, hi=0.97):
+    return max(lo, min(hi, x))
+
+
+def _match_state(m):
+    """From ESPN's set-by-set games: finished sets, the set in progress, sets won, games, tiebreaks."""
+    a_l, b_l = (m["sets"] + [[], []])[:2]
+    done, cur = [], (0, 0)
+    for i in range(max(len(a_l), len(b_l))):
+        x = a_l[i] if i < len(a_l) else 0
+        y = b_l[i] if i < len(b_l) else 0
+        if _set_over(x, y):
+            done.append((x, y))
+        else:
+            cur = (x, y)
+            break
+    return {"done": done, "cur": cur,
+            "sw": (sum(1 for x, y in done if x > y), sum(1 for x, y in done if y > x)),
+            "g_done": (sum(x for x, _ in done), sum(y for _, y in done)),
+            "tbs": sum(1 for x, y in done if max(x, y) == 7 and min(x, y) == 6),
+            "ns": len(done), "set1": (done[0][0] + done[0][1]) if done else None}
+
+
+def _sim(st, hA, hB, tbA, best_of, n):
+    """Plays out the rest of the match n times. Each result: (games A, games B, sets played, tiebreaks, set-1 games, sets A, sets B).
+    The server is unknown, so it is picked at random and then alternates game by game."""
+    need = best_of // 2 + 1
+    out = []
+    rnd = _rng.random
+    for _ in range(n):
+        sa, sb = st["sw"]
+        ga, gb = st["g_done"]
+        tbs, ns, s1 = st["tbs"], st["ns"], st["set1"]
+        a, b = st["cur"]
+        srv_a = rnd() < 0.5
+        while sa < need and sb < need:
+            while not _set_over(a, b):
+                if a == 6 and b == 6:                     # tiebreak: counts as one game
+                    if rnd() < tbA:
+                        a += 1
+                    else:
+                        b += 1
+                    tbs += 1
+                    break
+                if rnd() < (hA if srv_a else 1 - hB):
+                    a += 1
+                else:
+                    b += 1
+                srv_a = not srv_a
+            ga += a
+            gb += b
+            ns += 1
+            if s1 is None:
+                s1 = a + b
+            if a > b:
+                sa += 1
+            else:
+                sb += 1
+            a = b = 0
+        out.append((ga, gb, ns, tbs, s1, sa, sb))
+    return out
+
+
+def _calibrate_hold(share, tg_line):
+    """Picks the serve-hold rate that makes a fresh match land on PrizePicks' pregame Total Games line."""
+    d = share - 0.5
+    st0 = {"sw": (0, 0), "g_done": (0, 0), "tbs": 0, "ns": 0, "set1": None, "cur": (0, 0)}
+    best = None
+    for base in (0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.82, 0.86):
+        sims = _sim(st0, _cl(base + d), _cl(base - d), _cl(0.5 + d, 0.1, 0.9), T_BEST_OF, 400)
+        tot = sorted(s[0] + s[1] for s in sims)
+        err = abs(tot[len(tot) // 2] - tg_line)
+        if best is None or err < best[0]:
+            best = (err, base)
+    return best[1]
+
+
+def _tval(norm, stat):
+    """Pregame value of a tennis line if saved, else the current board line, else None."""
+    if not norm:
+        return None
+    key = ("TENNIS", norm, stat, None)
+    v = _state["prior"].get(key)
+    if v:
+        return v
+    ln = _state["tboard"].get(key)
+    return ln["line"] if ln and ln["line"] > 0 else None
+
+
+def _resolve(espn_name, by_norm, last_idx):
+    """Matches an ESPN name to a PrizePicks name (exact, else same last name and first initial)."""
+    n = _norm(espn_name)
+    if n in by_norm:
+        return n
+    parts = n.split()
+    if not parts:
+        return None
+    cands = [c for c in last_idx.get(parts[-1], []) if c[:1] == n[:1]]
+    return cands[0] if len(cands) == 1 else None
+
+
+def tennis_matches_live():
+    out = []
+    for tour, base in TENNIS_ESPN.items():
+        try:
+            ms = _tennis_matches(base)
+        except Exception as e:
+            print(f"tennis ESPN error ({tour}):", e)
+            continue
+        for m in ms:
+            if m["state"] == "in" and len(m["names"]) == 2 and all(k == "athlete" for k in m["kinds"]):
+                m["tour"] = tour
+                out.append(m)
+    return out
+
+
+def _t_eval(ln, side, st, sims, share, played, m):
+    stat, L = ln["stat"], ln["line"]
+    if L <= 0:
+        return None
+    cur = st["cur"]
+    gA, gB = st["g_done"][0] + cur[0], st["g_done"][1] + cur[1]
+    gX, gY = (gA, gB) if side == 0 else (gB, gA)
+    sX, sY = st["sw"] if side == 0 else st["sw"][::-1]
+    if stat == "t_set1" and st["ns"] > 0:
+        return None                                        # 1st set is already settled
+    c = {"t_games": played, "t_gw": gX, "t_sets": st["ns"] + 1,
+         "t_tb": st["tbs"] + (1 if cur == (6, 6) else 0), "t_set1": cur[0] + cur[1],
+         "t_fant": 10 + gX - gY + 3 * (sX - sY)}[stat]
+    if stat != "t_fant" and c >= L:
+        return None                                        # the over has already hit (or the under is dead)
+    vals = []
+    for ga, gb, ns, tbs, s1, sa, sb in sims:
+        x, y = (ga, gb) if side == 0 else (gb, ga)
+        xs, ys = (sa, sb) if side == 0 else (sb, sa)
+        vals.append({"t_games": ga + gb, "t_gw": x, "t_sets": ns, "t_tb": tbs, "t_set1": s1,
+                     "t_fant": 10 + x - y + 3 * (xs - ys) + T_SERVE_ADJ}[stat])
+    n = len(vals)
+    p_over = sum(1 for v in vals if v > L) / n
+    p_under = sum(1 for v in vals if v < L) / n
+    direction, prob = ("OVER", p_over) if p_over >= p_under else ("UNDER", p_under)
+    need = T_MIN_PROB + (T_FANT_EXTRA if stat == "t_fant" else 0.0)
+    if prob < need:
+        return None
+    proj = sum(vals) / n
+    my_share = share if side == 0 else 1 - share
+    notes = [f"Hits {direction} in {prob:.0%} of {n} simulated finishes",
+             f"Has won {gX} of {played} games; strength estimate {my_share:.0%} of games from here"]
+    prior = _state["prior"].get(("TENNIS", ln["norm"], stat, None))
+    moved = (L - prior) if prior else 0.0
+    if abs(moved) >= 0.01:
+        notes.append(f"PrizePicks line has moved {moved:+g} since before the match")
+    if stat == "t_fant":
+        notes.append("Aces and double faults (±0.5 each) aren't in ESPN's live data, so a bigger edge is required")
+    if direction == "OVER":
+        notes.append("If a player retires, the stats so far stand: a risk for overs")
+    if ln["live"]:
+        notes.append("PrizePicks live line")
+    score = " ".join(f"{x}-{y}" for x, y in st["done"] + ([cur] if cur != (0, 0) or not st["done"] else []))
+    name_a, name_b = m["names"]
+    shape = "lopsided" if abs(gA - gB) >= 4 else "tight"
+    return {"direction": direction, "proj": proj, "gap": proj - L, "cur": c, "line": L, "margin": gX - gY,
+            "team": {}, "opp": {}, "notes": notes, "factor": 1.0, "moved": moved, "prob": prob,
+            "strength": prob / need, "shape": f"TENNIS-{shape}", "game": "T" + m["id"],
+            "score_txt": f"{name_a} {score} {name_b} • set {st['ns'] + 1}"}
+
+
+def tennis_cycle(raw):
+    """Finds juicy tennis picks in live singles matches. Returns [(key, line, event, alert)], at most one per match."""
+    tb = parse_tennis(raw)
+    _state["tboard"] = tb
+    matches = tennis_matches_live()
+    live_norms = {_norm(n) for m in matches for n in m["names"]}
+    update_priors(tb, {"TENNIS": live_norms})
+    if matches:
+        _state["tlive"] = time.time()
+    by_norm, last_idx = {}, {}
+    for key, ln in tb.items():
+        by_norm.setdefault(ln["norm"], []).append((key, ln))
+    for n in by_norm:
+        if n.split():
+            last_idx.setdefault(n.split()[-1], []).append(n)
+    fresh = []
+    for m in matches:
+        pa, pb = _resolve(m["names"][0], by_norm, last_idx), _resolve(m["names"][1], by_norm, last_idx)
+        if not pa and not pb:
+            continue
+        st = _match_state(m)
+        cur = st["cur"]
+        gA, gB = st["g_done"][0] + cur[0], st["g_done"][1] + cur[1]
+        played = gA + gB
+        if played < T_MIN_GAMES:
+            continue
+        gwA, gwB = _tval(pa, "t_gw"), _tval(pb, "t_gw")
+        tg = _tval(pa, "t_games") or _tval(pb, "t_games")
+        if gwA and gwB:
+            share0 = gwA / (gwA + gwB)
+        elif gwA and tg:
+            share0 = gwA / tg
+        elif gwB and tg:
+            share0 = 1 - gwB / tg
+        else:
+            share0 = 0.5
+        share0 = _cl(share0, 0.3, 0.7)
+        w = played / (played + T_PRIOR_GAMES)
+        share = _cl((1 - w) * share0 + w * (gA / played), 0.2, 0.8)
+        mid = m["id"]
+        if tg:
+            if mid not in _state["tcal"]:
+                _state["tcal"][mid] = _calibrate_hold(share0, tg)
+            base = _state["tcal"][mid]
+        else:
+            base = T_HOLD.get(m["tour"], 0.75)
+        d = share - 0.5
+        sims = _sim(st, _cl(base + d), _cl(base - d), _cl(0.5 + d, 0.1, 0.9), T_BEST_OF, T_SIMS)
+        event = {"id": "T" + mid, "name": f"{m['names'][0]} vs {m['names'][1]} ({m['tournament']})",
+                 "f": min(1.0, played / (tg or 22.0)), "period": st["ns"] + 1, "clock_txt": ""}
+        best, done_stats = None, set()
+        for side, pn in ((0, pa), (1, pb)):
+            if not pn:
+                continue
+            for key, ln in by_norm.get(pn, []):
+                if ln["stat"] in T_MATCH_LEVEL and ln["stat"] in done_stats:
+                    continue
+                if ln["live"] and key not in _state["t_logged"] and len(_state["t_logged"]) < 20:
+                    _state["t_logged"].add(key)
+                    print(f"TENNIS LIVE ROW: {ln['name']} {ln['stat']} live line {ln['line']:g} | flags {ln['flags']} | "
+                          f"games so far {played}")
+                a = _t_eval(ln, side, st, sims, share, played, m)
+                if not a:
+                    continue
+                if ln["stat"] in T_MATCH_LEVEL:
+                    done_stats.add(ln["stat"])
+                if best is None or a["prob"] > best[3]["prob"]:
+                    best = (key, ln, event, a)
+        if best:
+            fresh.append(best)
+    return fresh
+
+
 # ====================== ALERTS ======================
-def _can_alert(key, direction):
+def _room():
     now = time.time()
     _state["sent"] = [t for t in _state["sent"] if now - t < 3600]
-    if len(_state["sent"]) >= MAX_PER_HOUR:
+    return len(_state["sent"]) < MAX_PER_HOUR
+
+
+def _can_alert(key, direction):
+    if not _room():
         return False
     last = _state["alerts"].get(key)
-    if last and last[1] == direction and now - last[0] < COOLDOWN:
+    if last and last[1] == direction and time.time() - last[0] < COOLDOWN:
         return False
     return True
 
@@ -600,6 +928,8 @@ def _emoji(a):
 
 
 def _score_text(event, a):
+    if a.get("score_txt"):
+        return a["score_txt"]
     t, o = a["team"], a["opp"]
     return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • Q{event['period']} {event['clock_txt']}"
 
@@ -619,7 +949,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.6 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.7 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{' LIVE' if line['live'] else ''} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
@@ -635,14 +965,14 @@ def send_pair(c1, c2):
         _mark_sent(key, a)
         fields.append({"name": f"{_emoji(a)} {line['name']} — {stat_label(line)} {a['direction']} {line['line']:g}",
                        "value": f"{_leg_text(line, a)}\n_{event['name']} • {_score_text(event, a)}_"[:1000], "inline": False})
-        legs.append(f"{line['name']} {a['direction']} {line['line']:g}")
+        legs.append(f"{line['sport']} {line['name']} {line['stat']} {a['direction']} {line['line']:g}")
     _state["sent"].append(time.time())
     same_shape = c1[3]["shape"] == c2[3]["shape"]
     embed = {"title": "💓 Heartbeat — " + ("LIVE " if (c1[1]["live"] or c2[1]["live"]) else "") + "PAIR — lock these two",
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.6 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.7 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -663,6 +993,8 @@ def process_candidates(fresh):
     posted = 0
     if not PAIR_MODE:
         for c in ready:
+            if not _room():
+                break
             send_single(c, label="")
             posted += 1
         return posted
@@ -682,11 +1014,15 @@ def process_candidates(fresh):
             if best is None or score > best[0]:
                 best = (score, c2)
         if best:
+            if not _room():                            # hourly cap reached: stop posting this cycle
+                break
             send_pair(c1, best[1])
             used |= {c1[0], best[1][0]}
             posted += 1
     for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
         if c[0] not in used and now - _state["pending"].get(c[0], now) >= PAIR_WAIT:
+            if not _room():
+                break
             send_single(c)
             posted += 1
     return posted
@@ -717,12 +1053,14 @@ def discovery_report(board, live):
     nfl = sum(1 for k in board if k[0] == "NFL")
     nba = sum(1 for k in board if k[0] == "NBA")
     flags = {k: sorted(v)[:6] for k, v in _state["flags_seen"].items()}
-    lines = [f"Sports tracked: {', '.join(SPORTS)}",
-             f"PrizePicks lines I can model right now: NFL {nfl}, NBA {nba}",
+    lines = [f"Sports tracked: {', '.join(SPORTS)}" + (", TENNIS" if TENNIS_ON else ""),
+             f"PrizePicks lines I can model right now: NFL {nfl}, NBA {nba}"
+             + (f", tennis {len(_state['tboard'])}" if TENNIS_ON else ""),
              f"Live games right now: {sum(len(v) for v in live.values())}",
              f"PrizePicks attribute names seen: {', '.join(sorted(_state['keys_seen'])) or 'none yet'}",
              f"Status/odds flags seen: {flags or 'none'}"]
-    lines.append("Tennis discovery: " + ("ON (logging only, no tennis picks)" if TENNIS_DISCOVERY else "off"))
+    lines.append("Tennis alerts: " + (f"ON (only picks that hit in {T_MIN_PROB:.0%}+ of simulations)" if TENNIS_ON else "off"))
+    lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
     nm = sorted(_state["names"].get("NBA", set()))
@@ -730,7 +1068,7 @@ def discovery_report(board, live):
         lines.append("NBA stat names on the board: " + ", ".join(nm)[:600])
     print("DISCOVERY:", " | ".join(lines))
     if DISCOVERY_POST:
-        _post({"embeds": [{"title": "💓 Heartbeat online", "description": "\n".join(f"• {x}" for x in lines),
+        _post({"embeds": [{"title": "💓 Heartbeat online", "description": "\n".join(f"• {x}" for x in lines)[:4000],
                            "color": 3066993}]})
 
 
@@ -750,7 +1088,7 @@ def _tennis_pp_summary(raw):
             a = item["attributes"]
             rel = item.get("relationships", {})
             lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
-            if "TENNIS" not in lg and lg not in ("ATP", "WTA"):
+            if not _is_tennis_league(lg):
                 continue
             stat = str(a.get("stat_display_name") or a.get("stat_type") or "").strip()
             nm = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
@@ -773,12 +1111,14 @@ def _tennis_matches(base):
             comps += g.get("competitions") or []
         for c in comps:
             st = ((c.get("status") or {}).get("type") or {})
-            names, sets = [], []
+            names, sets, kinds = [], [], []
             for p in c.get("competitors") or []:
                 names.append((p.get("athlete") or {}).get("displayName") or p.get("displayName") or "?")
                 sets.append([int(_num(x.get("value"))) for x in (p.get("linescores") or [])])
+                kinds.append(p.get("type") or "")
             out.append({"id": str(c.get("id") or ev.get("id") or ""), "tournament": ev.get("name") or "", "state": st.get("state") or "",
-                        "detail": st.get("detail") or st.get("shortDetail") or "", "names": names, "sets": sets, "raw": c})
+                        "detail": st.get("detail") or st.get("shortDetail") or "", "names": names, "sets": sets,
+                        "kinds": kinds, "raw": c})
     return out
 
 
@@ -888,6 +1228,13 @@ def cycle(first=False):
             except Exception as e:
                 print(f"ESPN box score error ({sport} {ev['id']}):", e)
     update_priors(board, live_names)
+    # 2b) tennis (v1.7): its own scoreboard and model; an error here never stops NFL/NBA
+    t_fresh = []
+    if TENNIS_ON:
+        try:
+            t_fresh = tennis_cycle(raw)
+        except Exception as e:
+            print("tennis error:", e)
     n_names = sum(len(v) for v in _state["names"].values())
     if n_names != _state["names_printed"]:                 # new PrizePicks stat names showed up: log them so we can match them
         _state["names_printed"] = n_names
@@ -920,26 +1267,29 @@ def cycle(first=False):
             if a:
                 fresh.append((key, ln, ev, a))
             break
+    fresh += t_fresh
     sent = process_candidates(fresh)
     n_live = sum(len(v) for v in live.values())
-    if n_live or first:
-        print(f"cycle: {n_live} live games, {len(board)} lines tracked, {checked} projected, {sent} alerts")
+    if n_live or first or t_fresh:
+        print(f"cycle: {n_live} live games, {len(board)} lines tracked, {checked} projected, "
+              f"{len(t_fresh)} tennis picks, {sent} alerts")
 
 
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat starting. Sports: {SPORTS}. PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
+    print(f"Heartbeat v1.7 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+          f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
-    last_pp = 0.0
     while True:
         try:
             cycle(first)
             first = False
         except Exception as e:
             print("cycle error:", e)
-        # poll fast only while games are live; otherwise relax
-        any_live = any(_state["summ"]) and any(time.time() - v[0] < 120 for v in _state["summ"].values())
+        # poll fast only while games (or tennis matches) are live; otherwise relax
+        any_live = (any(time.time() - v[0] < 120 for v in _state["summ"].values())
+                    or time.time() - _state["tlive"] < 120)
         time.sleep(min(PP_POLL, ESPN_POLL) if any_live else max(PP_POLL, 60))
 
 
