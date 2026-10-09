@@ -1,4 +1,4 @@
-"""Heartbeat v1.9: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.1: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -42,7 +42,7 @@ import random
 import re
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -424,11 +424,35 @@ def _get_json(url):
     return r.json()
 
 
+def _espn_dates():
+    """Today's date in New York (and yesterday until 6 AM, for late games that run past midnight), as YYYYMMDD."""
+    now = datetime.now(_ET) if _ET is not timezone.utc else _now()
+    days = [now]
+    if now.hour < 6:
+        days.append(now - timedelta(days=1))
+    return [d.strftime("%Y%m%d") for d in days]
+
+
+def _scoreboard_events(sport):
+    """ESPN's scoreboard for the exact date(s). v1.9.1: the plain scoreboard can show an old day (seen for NHL), so ask by date."""
+    evs, seen = [], set()
+    for d in _espn_dates():
+        try:
+            data = _get_json(f"{ESPN[sport]}/scoreboard?dates={d}&limit=100")
+        except Exception as e:
+            print(f"ESPN scoreboard error ({sport} {d}):", e)
+            continue
+        for ev in data.get("events", []) or []:
+            if ev.get("id") not in seen:
+                seen.add(ev.get("id"))
+                evs.append(ev)
+    return evs
+
+
 def live_events(sport):
     """List of live games: id, period, clock seconds, elapsed fraction, team scores by ESPN team id."""
     out = []
-    data = _get_json(ESPN[sport] + "/scoreboard")
-    for ev in data.get("events", []) or []:
+    for ev in _scoreboard_events(sport):
         st = ev.get("status", {})
         if (st.get("type") or {}).get("state") != "in":
             continue
@@ -1203,7 +1227,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.1 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1229,7 +1253,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.1 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1492,6 +1516,15 @@ def cycle(first=False):
             except Exception as e:
                 print(f"ESPN box score error ({sport} {ev['id']}):", e)
     update_priors(board, live_names)
+    if time.time() - _state.get("diag_t", 0) > 600 and any(live.values()):     # every 10 min while games are live
+        _state["diag_t"] = time.time()
+        for sport in SPORTS:
+            names = live_names.get(sport, set())
+            mine = [k for k in board if k[0] == sport and k[1] in names]
+            with_prior = sum(1 for k in mine if get_prior(k, board[k])[0] is not None)
+            print(f"LIVE CHECK {sport}: {len(live.get(sport, []))} live games "
+                  f"({', '.join(ev['name'] for ev in live.get(sport, []))[:300]}) | "
+                  f"{len(mine)} PrizePicks lines for players in them | {with_prior} with a saved pregame line")
     # 2b) tennis (v1.7): its own scoreboard and model; an error here never stops NFL/NBA
     t_fresh = []
     if TENNIS_ON:
@@ -1549,7 +1582,7 @@ def cycle(first=False):
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat v1.9 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.1 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
