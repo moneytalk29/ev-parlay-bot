@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.2: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.3: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -305,22 +305,50 @@ def _post(payload):
 
 
 # ====================== PRIZEPICKS ======================
-def fetch_board():
-    r = _session.get(PP_URL, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if not PP_LIVE_URL or PP_LIVE_URL == PP_URL:
+def _pp_get(which, url):
+    """One PrizePicks call, with a pause after "429 Too Many Requests". Returns fresh data or None (then the last copy is used)."""
+    now = time.time()
+    if now < _state.get("pp_block_until", 0):
+        return None
+    try:
+        r = _session.get(url, timeout=20)
+        if r.status_code == 429:
+            wait = _num(r.headers.get("Retry-After"), 0) or min(300, max(60, 2 * _state.get("pp_backoff", 30)))
+            _state["pp_backoff"] = wait
+            _state["pp_block_until"] = now + wait
+            print(f"PrizePicks asked us to slow down (429): pausing PrizePicks calls for {wait:.0f}s, using the last board meanwhile")
+            return None
+        r.raise_for_status()
+        _state["pp_backoff"] = 30
+        data = r.json()
+        _state.setdefault("pp_cache", {})[which] = (now, data)
         return data
-    try:                                                     # second feed: in-game lines. Never fatal.
-        r2 = _session.get(PP_LIVE_URL, timeout=20)
-        r2.raise_for_status()
-        live = r2.json()
     except Exception as e:
-        if time.time() - _state.get("ppl_err_t", 0) > 600:
+        if which == "main" or time.time() - _state.get("ppl_err_t", 0) > 600:
             _state["ppl_err_t"] = time.time()
-            print("PrizePicks live feed error:", e)
+            print(f"PrizePicks {'live feed ' if which == 'live' else ''}error:", e)
+        return None
+
+
+def fetch_board():
+    """v1.9.3: ONE PrizePicks call per cycle. While games are live, cycles take turns between the normal board and the
+    in-game board, and each keeps its last copy, so the call rate stays the same as before v1.9.2."""
+    cache = _state.setdefault("pp_cache", {})
+    games_live = (any(time.time() - v[0] < 120 for v in _state["summ"].values())
+                  or time.time() - _state.get("tlive", 0) < 120)
+    use_live = bool(PP_LIVE_URL) and PP_LIVE_URL != PP_URL and games_live
+    turn = _state["pp_turn"] = _state.get("pp_turn", 0) + 1
+    if use_live and turn % 2 == 0 and "main" in cache:
+        _pp_get("live", PP_LIVE_URL)
+    else:
+        _pp_get("main", PP_URL)
+    if "main" not in cache:
+        raise RuntimeError("no PrizePicks board yet")
+    data = cache["main"][1]
+    lv = cache.get("live")
+    if not use_live or not lv or time.time() - lv[0] > 180:     # in-game copy older than 3 minutes: don't use it
         return data
-    rows = live.get("data", []) or []
+    rows = lv[1].get("data", []) or []
     for item in rows:
         item["_live_feed"] = True
     if time.time() - _state.get("ppl_log_t", 0) > 600:      # every 10 min: what the live feed holds
@@ -330,7 +358,7 @@ def fetch_board():
         flagged = sum(1 for it in rows if str((it.get("attributes") or {}).get("is_live")).lower() == "true"
                       or str((it.get("attributes") or {}).get("in_game")).lower() == "true")
         print(f"PP LIVE FEED: {len(rows)} rows, {started} for games already started, {flagged} flagged live")
-    return {"data": (data.get("data") or []) + rows, "included": (data.get("included") or []) + (live.get("included") or [])}
+    return {"data": (data.get("data") or []) + rows, "included": (data.get("included") or []) + (lv[1].get("included") or [])}
 
 
 def parse_board(data):
@@ -380,7 +408,7 @@ def parse_board(data):
                 _state["flags_seen"].setdefault(k, set()).add(str(v))
             live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
                         or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress")
-                        or (item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
+                        or bool(item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
             key = (sport, _norm(name), stat[0], half)
             if key in out and out[key]["live"] and not live_row:
                 continue                             # a live row for this player/stat beats a stale pregame row
@@ -432,7 +460,7 @@ def parse_tennis(data):
             flags = {k: a.get(k) for k in ("status", "is_live", "in_game", "odds_type") if k in a}
             live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
                         or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress")
-                        or (item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
+                        or bool(item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
             key = ("TENNIS", _norm(name), stat, None)
             if key in out and out[key]["live"] and not live_row:
                 continue
@@ -1254,7 +1282,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.2 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.3 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1280,7 +1308,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.2 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.3 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1611,7 +1639,7 @@ def cycle(first=False):
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat v1.9.2 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.3 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
