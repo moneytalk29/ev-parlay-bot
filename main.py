@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.1: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.2: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -56,6 +56,9 @@ import requests
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA,NHL").split(",") if s.strip()]
 PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
+# v1.9.2: PrizePicks takes pregame lines down at kickoff. In-game lines may only come from a second feed (in_game=true).
+# Its rows count as live only once their game has started, so pregame lines are never mistaken for live ones.
+PP_LIVE_URL = os.getenv("PP_LIVE_URL", PP_URL + "&in_game=true")
 PP_POLL = float(os.getenv("HB_PP_POLL_SECONDS", "30"))        # how often to re-read PrizePicks
 ESPN_POLL = float(os.getenv("HB_ESPN_POLL_SECONDS", "30"))    # how often to re-read live scores/box scores
 EDGE_PCT = float(os.getenv("HB_EDGE_PCT", "0.10"))            # gap needed, as a share of the line
@@ -305,7 +308,29 @@ def _post(payload):
 def fetch_board():
     r = _session.get(PP_URL, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if not PP_LIVE_URL or PP_LIVE_URL == PP_URL:
+        return data
+    try:                                                     # second feed: in-game lines. Never fatal.
+        r2 = _session.get(PP_LIVE_URL, timeout=20)
+        r2.raise_for_status()
+        live = r2.json()
+    except Exception as e:
+        if time.time() - _state.get("ppl_err_t", 0) > 600:
+            _state["ppl_err_t"] = time.time()
+            print("PrizePicks live feed error:", e)
+        return data
+    rows = live.get("data", []) or []
+    for item in rows:
+        item["_live_feed"] = True
+    if time.time() - _state.get("ppl_log_t", 0) > 600:      # every 10 min: what the live feed holds
+        _state["ppl_log_t"] = time.time()
+        now = _now()
+        started = sum(1 for it in rows if (_to_dt((it.get("attributes") or {}).get("start_time")) or now) < now)
+        flagged = sum(1 for it in rows if str((it.get("attributes") or {}).get("is_live")).lower() == "true"
+                      or str((it.get("attributes") or {}).get("in_game")).lower() == "true")
+        print(f"PP LIVE FEED: {len(rows)} rows, {started} for games already started, {flagged} flagged live")
+    return {"data": (data.get("data") or []) + rows, "included": (data.get("included") or []) + (live.get("included") or [])}
 
 
 def parse_board(data):
@@ -354,7 +379,8 @@ def parse_board(data):
             for k, v in flags.items():
                 _state["flags_seen"].setdefault(k, set()).add(str(v))
             live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
-                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress"))
+                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress")
+                        or (item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
             key = (sport, _norm(name), stat[0], half)
             if key in out and out[key]["live"] and not live_row:
                 continue                             # a live row for this player/stat beats a stale pregame row
@@ -405,7 +431,8 @@ def parse_tennis(data):
             start = a.get("start_time") or (games.get(gid) or {}).get("start_time") or ""
             flags = {k: a.get(k) for k in ("status", "is_live", "in_game", "odds_type") if k in a}
             live_row = (str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true"
-                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress"))
+                        or str(a.get("status") or "").lower() in ("in_game", "live", "in_progress")
+                        or (item.get("_live_feed") and (_to_dt(start) or _now()) < _now()))
             key = ("TENNIS", _norm(name), stat, None)
             if key in out and out[key]["live"] and not live_row:
                 continue
@@ -1227,7 +1254,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.1 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.2 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1253,7 +1280,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.1 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.2 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1522,6 +1549,8 @@ def cycle(first=False):
             names = live_names.get(sport, set())
             mine = [k for k in board if k[0] == sport and k[1] in names]
             with_prior = sum(1 for k in mine if get_prior(k, board[k])[0] is not None)
+            if sport == SPORTS[0]:
+                print(f"LIVE CHECK board: {len(board)} lines, {sum(1 for v in board.values() if v['live'])} marked live")
             print(f"LIVE CHECK {sport}: {len(live.get(sport, []))} live games "
                   f"({', '.join(ev['name'] for ev in live.get(sport, []))[:300]}) | "
                   f"{len(mine)} PrizePicks lines for players in them | {with_prior} with a saved pregame line")
@@ -1582,7 +1611,7 @@ def cycle(first=False):
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat v1.9.1 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.2 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
