@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.3: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.4: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -37,6 +37,8 @@ Honest limits (read these)
     set HB_TENNIS_BEST_OF=5 for those weeks). If a player retires, PrizePicks keeps the stats so far (risk for overs).
 Everything is a Railway variable. Only WEBHOOK_URL is required.
 """
+import gc
+import json
 import os
 import random
 import re
@@ -59,6 +61,11 @@ PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per
 # v1.9.2: PrizePicks takes pregame lines down at kickoff. In-game lines may only come from a second feed (in_game=true).
 # Its rows count as live only once their game has started, so pregame lines are never mistaken for live ones.
 PP_LIVE_URL = os.getenv("PP_LIVE_URL", PP_URL + "&in_game=true")
+# v1.9.4: the in-game feed holds every sport (40,000+ rows) and ran the service out of memory. It is now asked for ONE
+# league at a time (league_id), only for leagues with live games, and everything else is thrown away right after reading.
+PP_LIVE_MAX_AGE = float(os.getenv("HB_PP_LIVE_MAX_AGE", "240"))       # ignore an in-game copy older than 4 minutes
+# v1.9.4: saved pregame lines are written to a file so a restart doesn't wipe them (kept 36 hours).
+STATE_FILE = os.getenv("HB_STATE_FILE", "/tmp/heartbeat_state.json")
 PP_POLL = float(os.getenv("HB_PP_POLL_SECONDS", "30"))        # how often to re-read PrizePicks
 ESPN_POLL = float(os.getenv("HB_ESPN_POLL_SECONDS", "30"))    # how often to re-read live scores/box scores
 EDGE_PCT = float(os.getenv("HB_EDGE_PCT", "0.10"))            # gap needed, as a share of the line
@@ -326,39 +333,137 @@ def _pp_get(which, url):
     except Exception as e:
         if which == "main" or time.time() - _state.get("ppl_err_t", 0) > 600:
             _state["ppl_err_t"] = time.time()
-            print(f"PrizePicks {'live feed ' if which == 'live' else ''}error:", e)
+            print(f"PrizePicks {'live feed ' if which.startswith('live') else ''}error:", e)
         return None
 
 
+def _mem_mb():
+    """Memory the bot is using right now, in MB (Linux). 0 if unknown."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except Exception:
+        return 0.0
+
+
+def _wanted_league_ids(main_data):
+    """PrizePicks league ids for our sports (from the normal board), only for sports with live games right now."""
+    live_sports = _state.get("live_sports", set())
+    tennis_live = time.time() - _state.get("tlive", 0) < 180
+    ids = []
+    for inc in main_data.get("included", []) or []:
+        if inc.get("type") != "league":
+            continue
+        name = ((inc.get("attributes") or {}).get("name") or "").upper()
+        if name in live_sports or (TENNIS_ON and tennis_live and _is_tennis_league(name)):
+            ids.append((str(inc.get("id")), name))
+    return sorted(set(ids))
+
+
+def _slim(data, league_id):
+    """Keep only this league's rows and the players/games they point to; drop the rest straight away."""
+    rows = [it for it in (data.get("data") or [])
+            if str(((it.get("relationships") or {}).get("league") or {}).get("data", {}).get("id")) == league_id]
+    need = set()
+    for it in rows:
+        for rel in ("new_player", "game", "league"):
+            d = ((it.get("relationships") or {}).get(rel) or {}).get("data") or {}
+            if d.get("id") is not None:
+                need.add((rel if rel != "new_player" else "new_player", str(d["id"])))
+    inc = [x for x in (data.get("included") or []) if (x.get("type"), str(x.get("id"))) in need]
+    return {"data": rows, "included": inc}
+
+
 def fetch_board():
-    """v1.9.3: ONE PrizePicks call per cycle. While games are live, cycles take turns between the normal board and the
-    in-game board, and each keeps its last copy, so the call rate stays the same as before v1.9.2."""
+    """ONE PrizePicks call per cycle. While games are live, the normal board is refreshed about every 90 seconds and the
+    cycles in between read the in-game lines of ONE live league each (v1.9.4), so memory and the call rate stay low."""
     cache = _state.setdefault("pp_cache", {})
-    games_live = (any(time.time() - v[0] < 120 for v in _state["summ"].values())
-                  or time.time() - _state.get("tlive", 0) < 120)
-    use_live = bool(PP_LIVE_URL) and PP_LIVE_URL != PP_URL and games_live
-    turn = _state["pp_turn"] = _state.get("pp_turn", 0) + 1
-    if use_live and turn % 2 == 0 and "main" in cache:
-        _pp_get("live", PP_LIVE_URL)
-    else:
+    now = time.time()
+    main = cache.get("main")
+    leagues = _wanted_league_ids(main[1]) if main else []
+    use_live = bool(PP_LIVE_URL) and PP_LIVE_URL != PP_URL and bool(leagues)
+    if not main or not use_live or now - main[0] >= 90:
         _pp_get("main", PP_URL)
+    else:
+        turn = _state["pp_turn"] = _state.get("pp_turn", 0) + 1
+        lid, lname = leagues[turn % len(leagues)]
+        got = _pp_get("live_tmp", f"{PP_LIVE_URL}&league_id={lid}")
+        cache.pop("live_tmp", None)
+        if got is not None:
+            raw_n = len(got.get("data") or [])
+            slim = _slim(got, lid)
+            del got
+            gc.collect()
+            cache["live:" + lid] = (now, slim)
+            if raw_n > 5000 and now - _state.get("ppl_big_t", 0) > 600:
+                _state["ppl_big_t"] = now
+                print(f"PP LIVE FEED {lname}: PrizePicks ignored the league filter ({raw_n} rows), kept {len(slim['data'])}")
     if "main" not in cache:
         raise RuntimeError("no PrizePicks board yet")
     data = cache["main"][1]
-    lv = cache.get("live")
-    if not use_live or not lv or time.time() - lv[0] > 180:     # in-game copy older than 3 minutes: don't use it
+    rows, inc = [], []
+    for key in list(cache):
+        if not key.startswith("live:"):
+            continue
+        t, lv = cache[key]
+        if now - t > PP_LIVE_MAX_AGE or key[5:] not in {l for l, _ in leagues}:
+            del cache[key]                                   # stale, or that league has no live games any more
+            continue
+        for item in lv.get("data", []) or []:
+            item["_live_feed"] = True
+        rows += lv.get("data", []) or []
+        inc += lv.get("included", []) or []
+    if not rows:
         return data
-    rows = lv[1].get("data", []) or []
-    for item in rows:
-        item["_live_feed"] = True
-    if time.time() - _state.get("ppl_log_t", 0) > 600:      # every 10 min: what the live feed holds
-        _state["ppl_log_t"] = time.time()
-        now = _now()
-        started = sum(1 for it in rows if (_to_dt((it.get("attributes") or {}).get("start_time")) or now) < now)
-        flagged = sum(1 for it in rows if str((it.get("attributes") or {}).get("is_live")).lower() == "true"
-                      or str((it.get("attributes") or {}).get("in_game")).lower() == "true")
-        print(f"PP LIVE FEED: {len(rows)} rows, {started} for games already started, {flagged} flagged live")
-    return {"data": (data.get("data") or []) + rows, "included": (data.get("included") or []) + (lv[1].get("included") or [])}
+    if now - _state.get("ppl_log_t", 0) > 600:              # every 10 min: what the in-game lines hold
+        _state["ppl_log_t"] = now
+        n = _now()
+        started = sum(1 for it in rows if (_to_dt((it.get("attributes") or {}).get("start_time")) or n) < n)
+        print(f"PP LIVE FEED: {len(rows)} in-game rows for {', '.join(nm for _, nm in leagues)}, "
+              f"{started} for games already started | memory {_mem_mb():.0f} MB")
+    return {"data": (data.get("data") or []) + rows, "included": (data.get("included") or []) + inc}
+
+
+# ====================== SAVED PREGAME LINES (v1.9.4) ======================
+def save_state(force=False):
+    """Writes the saved pregame lines to a file, at most once a minute."""
+    now = time.time()
+    if not force and now - _state.get("save_t", 0) < 60:
+        return
+    _state["save_t"] = now
+    pt = _state.setdefault("prior_t", {})
+    keep = [[list(k), v, pt.get(k, now)] for k, v in _state["prior"].items() if now - pt.get(k, now) < 36 * 3600]
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"v": 1, "prior": keep}, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        if now - _state.get("save_err_t", 0) > 3600:
+            _state["save_err_t"] = now
+            print("could not save pregame lines:", e)
+
+
+def load_state():
+    """Reads saved pregame lines back after a restart. Lines older than 36 hours are dropped."""
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        print("SAVED LINES: none found (first start, or Railway gave the bot a fresh disk)")
+        return
+    except Exception as e:
+        print("SAVED LINES: could not read the file:", e)
+        return
+    now, n = time.time(), 0
+    pt = _state.setdefault("prior_t", {})
+    for k, v, t in d.get("prior", []):
+        if now - t < 36 * 3600:
+            key = tuple(k)
+            _state["prior"][key] = v
+            pt[key] = t
+            n += 1
+    print(f"SAVED LINES: restored {n} pregame lines from before the restart")
 
 
 def parse_board(data):
@@ -1282,7 +1387,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.3 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1308,7 +1413,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.3 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.4 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1532,7 +1637,9 @@ def update_priors(board, live_names):
         started = (ln["live"] or (ln["start"] is not None and now >= ln["start"])
                    or ln["norm"] in live_names.get(ln["sport"], set()))
         if not started and ln["line"] > 0:
-            _state["prior"][key] = ln["line"]
+            if _state["prior"].get(key) != ln["line"]:
+                _state["prior"][key] = ln["line"]
+                _state.setdefault("prior_t", {})[key] = time.time()
 
 
 def cycle(first=False):
@@ -1571,6 +1678,8 @@ def cycle(first=False):
             except Exception as e:
                 print(f"ESPN box score error ({sport} {ev['id']}):", e)
     update_priors(board, live_names)
+    _state["live_sports"] = {sp for sp in SPORTS if live.get(sp)}
+    save_state()
     if time.time() - _state.get("diag_t", 0) > 600 and any(live.values()):     # every 10 min while games are live
         _state["diag_t"] = time.time()
         for sport in SPORTS:
@@ -1578,7 +1687,8 @@ def cycle(first=False):
             mine = [k for k in board if k[0] == sport and k[1] in names]
             with_prior = sum(1 for k in mine if get_prior(k, board[k])[0] is not None)
             if sport == SPORTS[0]:
-                print(f"LIVE CHECK board: {len(board)} lines, {sum(1 for v in board.values() if v['live'])} marked live")
+                print(f"LIVE CHECK board: {len(board)} lines, {sum(1 for v in board.values() if v['live'])} marked live | "
+                      f"memory {_mem_mb():.0f} MB")
             print(f"LIVE CHECK {sport}: {len(live.get(sport, []))} live games "
                   f"({', '.join(ev['name'] for ev in live.get(sport, []))[:300]}) | "
                   f"{len(mine)} PrizePicks lines for players in them | {with_prior} with a saved pregame line")
@@ -1639,7 +1749,8 @@ def cycle(first=False):
 def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
-    print(f"Heartbeat v1.9.3 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    load_state()
+    print(f"Heartbeat v1.9.4 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
