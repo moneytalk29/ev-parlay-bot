@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.4: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.5: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -148,7 +148,12 @@ STAT_MAP = {
             "rush yards": ("rush_yds", "rush"), "rushing yards": ("rush_yds", "rush"),
             "rush attempts": ("rush_att", "rush"), "rushing attempts": ("rush_att", "rush"), "carries": ("rush_att", "rush"),
             "receiving yards": ("rec_yds", "rec"), "rec yards": ("rec_yds", "rec"),
-            "receptions": ("rec_cnt", "rec")},
+            "receptions": ("rec_cnt", "rec"),
+            # v1.9.5: combo lines, used only by the pregame check
+            "pass yds": ("pass_yds", "pass"), "rush yds": ("rush_yds", "rush"), "receiving yds": ("rec_yds", "rec"),
+            "rush+rec yds": ("rr_yds", "combo"), "rush + rec yds": ("rr_yds", "combo"),
+            "rushing+receiving yards": ("rr_yds", "combo"), "pass+rush yds": ("pq_yds", "combo"),
+            "pass + rush yds": ("pq_yds", "combo"), "passing+rushing yards": ("pq_yds", "combo")},
     "NBA": {"points": ("pts", "nba"), "rebounds": ("reb", "nba"), "assists": ("ast", "nba"),
             "3-pt made": ("fg3", "nba"), "3-pointers made": ("fg3", "nba"), "three pointers made": ("fg3", "nba"),
             "3pt made": ("fg3", "nba"), "3ptm": ("fg3", "nba"), "3pm": ("fg3", "nba"),
@@ -158,7 +163,9 @@ STAT_MAP = {
             "points+assists": ("pa", "nba"), "rebs+asts": ("ra", "nba"), "rebounds+assists": ("ra", "nba")},
     "NHL": {"shots on goal": ("sog", "shots"), "shots": ("sog", "shots"), "sog": ("sog", "shots"),
             "goalie saves": ("saves", "goalie"), "saves": ("saves", "goalie"),
-            "blocked shots": ("nhl_blk", "def"), "hits": ("hits", "hits")},
+            "blocked shots": ("nhl_blk", "def"), "hits": ("hits", "hits"),
+            # v1.9.5: used only by the pregame check (Points vs Goals + Assists)
+            "goals": ("nhl_g", "pre"), "assists": ("nhl_a", "pre"), "points": ("nhl_pts", "pre")},
 }
 # PrizePicks tennis stat name (lowercase) -> stat key. Aces, double faults and break points are left out on purpose.
 TENNIS_STATS = {"total games": "t_games", "total games won": "t_gw", "total sets": "t_sets",
@@ -174,7 +181,8 @@ STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp":
               "t_games": "Total Games", "t_gw": "Total Games Won", "t_sets": "Total Sets", "t_tb": "Total Tie Breaks",
               "t_set1": "1st Set Total Games", "t_fant": "Fantasy Score",
               "t_aces": "Aces", "t_df": "Double Faults",
-              "sog": "Shots On Goal", "saves": "Goalie Saves", "nhl_blk": "Blocked Shots", "hits": "Hits"}
+              "sog": "Shots On Goal", "saves": "Goalie Saves", "nhl_blk": "Blocked Shots", "hits": "Hits",
+              "nhl_g": "Goals", "nhl_a": "Assists", "nhl_pts": "Points", "rr_yds": "Rush+Rec Yds", "pq_yds": "Pass+Rush Yds"}
 MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
                 "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0, "pr": 3.0, "pa": 3.0, "ra": 2.0,
                 "sog": 1.0, "saves": 3.0, "nhl_blk": 1.0, "hits": 1.0}
@@ -495,9 +503,9 @@ def parse_board(data):
                     continue
                 stat, half = (cl[0], "nba"), cl[1]
             else:
-                if any(b in stat_name for b in BAD_WORDS):
-                    continue
                 stat = STAT_MAP.get(sport, {}).get(stat_name)
+                if not stat and any(b in stat_name for b in BAD_WORDS):
+                    continue
                 if not stat:
                     continue
             odds_type = str(a.get("odds_type") or "standard").lower()
@@ -1292,13 +1300,31 @@ def tennis_pregame(tb):
 
 
 NBA_COMBOS = (("pra", ("pts", "reb", "ast")), ("pr", ("pts", "reb")), ("pa", ("pts", "ast")), ("ra", ("reb", "ast")))
+# v1.9.5: (combos, smallest gap, gap as a share of the line) per sport
+PRE_COMBOS = {
+    "NBA": (NBA_COMBOS, PRE_NBA_GAP, 0.08),
+    "NFL": ((("rr_yds", ("rush_yds", "rec_yds")), ("pq_yds", ("pass_yds", "rush_yds"))),
+            float(os.getenv("HB_PRE_NFL_GAP", "10")), 0.10),
+    # NHL lines are mostly 0.5 / 1.5, and Goals 0.5 + Assists 0.5 vs Points 0.5 is normal, so only a gap of a full
+    # point or more counts.
+    "NHL": ((("nhl_pts", ("nhl_g", "nhl_a")),), float(os.getenv("HB_PRE_NHL_GAP", "1.0")), 0.0),
+}
 
 
-def nba_pregame(board):
-    """NBA: a combo line (PRA, Pts+Rebs, Pts+Asts, Rebs+Asts) that is far from the sum of the player's single lines."""
+def all_combo_pregame(board):
+    out = []
+    for sport, (combos, gap_min, pct) in PRE_COMBOS.items():
+        if sport in SPORTS:
+            out += nba_pregame(board, sport, combos, gap_min, pct)
+    return out
+
+
+def nba_pregame(board, sport="NBA", combos=NBA_COMBOS, gap_min=None, pct=0.08):
+    """A combo line (NBA PRA etc., NFL Rush+Rec Yds, NHL Points) that is far from the sum of the player's single lines."""
+    gap_min = PRE_NBA_GAP if gap_min is None else gap_min
     players = {}
     for key, ln in board.items():
-        if ln["sport"] == "NBA" and ln.get("half") is None and ln["line"] > 0:
+        if ln["sport"] == sport and ln.get("half") is None and ln["line"] > 0 and not ln["live"]:
             players.setdefault(ln["norm"], {})[ln["stat"]] = (key, ln)
     out = []
     for norm, D in players.items():
@@ -1306,13 +1332,13 @@ def nba_pregame(board):
         if not start:
             continue
         best = None
-        for combo, parts in NBA_COMBOS:
+        for combo, parts in combos:
             if combo not in D or not all(p in D for p in parts):
                 continue
             key, ln = D[combo]
             total = sum(D[p][1]["line"] for p in parts)
             gap = total - ln["line"]
-            need = max(PRE_NBA_GAP, 0.08 * ln["line"])
+            need = max(gap_min, pct * ln["line"])
             if abs(gap) < need:
                 continue
             direction = "OVER" if gap > 0 else "UNDER"
@@ -1323,8 +1349,9 @@ def nba_pregame(board):
             a = {"direction": direction, "proj": total, "gap": gap, "cur": 0, "line": ln["line"], "margin": 0,
                  "team": {}, "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": 0.0,
                  "strength": abs(gap) / need, "shape": "PRE-pregame", "game": "NP" + str(ln.get("gid") or norm),
+                 "sport": sport,
                  "pre": True, "score_txt": f"{ln['opp'] or 'Game'} • starts {_start_txt(start)}"}
-            ev = {"id": a["game"], "name": f"{ln['name']} ({ln['team'] or 'NBA'})", "f": 0.0, "period": 0, "clock_txt": ""}
+            ev = {"id": a["game"], "name": f"{ln['name']} ({ln['team'] or sport})", "f": 0.0, "period": 0, "clock_txt": ""}
             if best is None or a["strength"] > best[3]["strength"]:
                 best = (key, ln, ev, a)
         if best:
@@ -1387,7 +1414,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.5 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1413,7 +1440,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.4 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.5 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1735,7 +1762,7 @@ def cycle(first=False):
     pre_fresh = []
     if PREGAME_ON:
         try:
-            pre_fresh = nba_pregame(board) + (tennis_pregame(_state["tboard"]) if TENNIS_ON else [])
+            pre_fresh = all_combo_pregame(board) + (tennis_pregame(_state["tboard"]) if TENNIS_ON else [])
         except Exception as e:                      # the pregame check can never stop live alerts
             print("pregame error:", e)
     fresh += pre_fresh
@@ -1750,7 +1777,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v1.9.4 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.5 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
