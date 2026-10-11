@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.6: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.7: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -65,7 +65,9 @@ PP_LIVE_URL = os.getenv("PP_LIVE_URL", PP_URL + "&in_game=true")
 # league at a time (league_id), only for leagues with live games, and everything else is thrown away right after reading.
 PP_LIVE_MAX_AGE = float(os.getenv("HB_PP_LIVE_MAX_AGE", "240"))       # ignore an in-game copy older than 4 minutes
 # v1.9.4: saved pregame lines are written to a file so a restart doesn't wipe them (kept 36 hours).
-STATE_FILE = os.getenv("HB_STATE_FILE", "/tmp/heartbeat_state.json")
+# v1.9.7: if a Railway Volume is attached, Railway tells the bot where (RAILWAY_VOLUME_MOUNT_PATH) and the file goes there,
+# so it survives new deploys too. Without a Volume the file is lost on every deploy.
+STATE_FILE = os.getenv("HB_STATE_FILE") or os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/tmp", "heartbeat_state.json")
 PP_POLL = float(os.getenv("HB_PP_POLL_SECONDS", "30"))        # how often to re-read PrizePicks
 ESPN_POLL = float(os.getenv("HB_ESPN_POLL_SECONDS", "30"))    # how often to re-read live scores/box scores
 EDGE_PCT = float(os.getenv("HB_EDGE_PCT", "0.10"))            # gap needed, as a share of the line
@@ -458,7 +460,7 @@ def load_state():
         with open(STATE_FILE) as f:
             d = json.load(f)
     except FileNotFoundError:
-        print("SAVED LINES: none found (first start, or Railway gave the bot a fresh disk)")
+        print(f"SAVED LINES: none found in {STATE_FILE} (first start, or no Railway Volume attached)")
         return
     except Exception as e:
         print("SAVED LINES: could not read the file:", e)
@@ -471,7 +473,7 @@ def load_state():
             _state["prior"][key] = v
             pt[key] = t
             n += 1
-    print(f"SAVED LINES: restored {n} pregame lines from before the restart")
+    print(f"SAVED LINES: restored {n} pregame lines from before the restart ({STATE_FILE})")
 
 
 def parse_board(data):
@@ -1417,7 +1419,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.6 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.7 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1443,7 +1445,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.6 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.7 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1780,7 +1782,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v1.9.6 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.7 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
