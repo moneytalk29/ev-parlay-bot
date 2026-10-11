@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.5: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v1.9.6: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -693,9 +693,10 @@ def box_score(sport, event_id):
 
 # ====================== MODEL ======================
 def _blend_total(prior, current, f):
-    """Full-game expectation: the pregame line, nudged toward the player's pace so far."""
-    if f >= 0.2 and current is not None:
-        w = min(PACE_WEIGHT_MAX, 0.7 * f)
+    """Full-game expectation: the pregame line, nudged toward the player's pace so far.
+    v1.9.6: the pace only starts to count after a quarter of the game and grows slowly (one slow quarter is noise)."""
+    if current is not None and f > 0.25:
+        w = min(PACE_WEIGHT_MAX, 0.8 * (f - 0.25))
         return (1 - w) * prior + w * (current / f)
     return prior
 
@@ -932,6 +933,8 @@ def evaluate(line, event, box, prior):
             return None
     elif SCRIPT_ONLY and abs(factor - 1) < SCRIPT_MIN:
         return None
+    if half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1):
+        return None                                  # v1.9.6: never post a pick against the game script
     moved = L - prior
     if abs(moved) >= 0.01:
         notes.append(f"PrizePicks line has moved {moved:+g} since pregame (some of the script may already be priced in)")
@@ -1414,7 +1417,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.5 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v1.9.6 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
              "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
@@ -1440,7 +1443,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.5 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v1.9.6 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]})
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -1777,7 +1780,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v1.9.5 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v1.9.6 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
