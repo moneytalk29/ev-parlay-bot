@@ -1,4 +1,4 @@
-"""Heartbeat v1.9.7: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v2.1: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -56,6 +56,8 @@ import requests
 
 # ====================== SETTINGS (Railway variables) ======================
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# v2.0: pregame picks go to their own Discord channel when this is set (otherwise to WEBHOOK_URL, like before)
+PREGAME_WEBHOOK_URL = os.getenv("PREGAME_WEBHOOK_URL")
 SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA,NHL").split(",") if s.strip()]
 PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
 # v1.9.2: PrizePicks takes pregame lines down at kickoff. In-game lines may only come from a second feed (in_game=true).
@@ -110,6 +112,9 @@ FANT = tuple(float(x) for x in os.getenv("HB_FANT_WEIGHTS", "1,1.2,1.5,3,3,-1").
 # The first live game will show which one it is (see the "LIVE ROW" log lines). Change this if it turns out to be "rest".
 LIVE_LINE_MODE = os.getenv("HB_LIVE_LINE_MODE", "full").lower()
 
+# v1.9.8: picks where the player's pace and the game script disagree are posted alone with a CAUTION tag.
+# HB_CAUTION=false hides them completely.
+CAUTION_ON = os.getenv("HB_CAUTION", "true").lower() == "true"
 # Tennis alerts (v1.7): ON by default. HB_TENNIS=false turns them off.
 TENNIS_ON = os.getenv("HB_TENNIS", "true").lower() == "true"
 T_MIN_PROB = float(os.getenv("HB_TENNIS_MIN_PROB", "0.70"))        # "juicy": the pick must hit in 70%+ of simulated finishes
@@ -167,7 +172,12 @@ STAT_MAP = {
             "goalie saves": ("saves", "goalie"), "saves": ("saves", "goalie"),
             "blocked shots": ("nhl_blk", "def"), "hits": ("hits", "hits"),
             # v1.9.5: used only by the pregame check (Points vs Goals + Assists)
-            "goals": ("nhl_g", "pre"), "assists": ("nhl_a", "pre"), "points": ("nhl_pts", "pre")},
+            "goals": ("nhl_g", "pre"), "assists": ("nhl_a", "pre"), "points": ("nhl_pts", "pre"),
+            # v1.9.9: two goalies' saves added together (pregame check only)
+            "goalie saves (combo)": ("saves_combo", "pre"), "goalie saves combo": ("saves_combo", "pre"),
+            "saves (combo)": ("saves_combo", "pre"), "goalie saves (combos)": ("saves_combo", "pre"),
+            # v2.0: pregame recent-form only
+            "faceoffs won": ("fow", "pre"), "time on ice": ("toi", "pre"), "fantasy score": ("nhl_fant", "pre")},
 }
 # PrizePicks tennis stat name (lowercase) -> stat key. Aces, double faults and break points are left out on purpose.
 TENNIS_STATS = {"total games": "t_games", "total games won": "t_gw", "total sets": "t_sets",
@@ -184,7 +194,9 @@ STAT_LABEL = {"pass_yds": "Pass Yards", "pass_att": "Pass Attempts", "pass_cmp":
               "t_set1": "1st Set Total Games", "t_fant": "Fantasy Score",
               "t_aces": "Aces", "t_df": "Double Faults",
               "sog": "Shots On Goal", "saves": "Goalie Saves", "nhl_blk": "Blocked Shots", "hits": "Hits",
-              "nhl_g": "Goals", "nhl_a": "Assists", "nhl_pts": "Points", "rr_yds": "Rush+Rec Yds", "pq_yds": "Pass+Rush Yds"}
+              "nhl_g": "Goals", "nhl_a": "Assists", "nhl_pts": "Points", "rr_yds": "Rush+Rec Yds", "pq_yds": "Pass+Rush Yds",
+              "saves_combo": "Goalie Saves (Combo)", "fow": "Faceoffs Won", "toi": "Time On Ice",
+              "nhl_fant": "Fantasy Score"}
 MIN_ABS_EDGE = {"pass_yds": 12, "pass_att": 3, "pass_cmp": 2.5, "rush_yds": 8, "rush_att": 2.5, "rec_yds": 12, "rec_cnt": 1.5,
                 "pts": 3.5, "reb": 1.5, "ast": 1.5, "fg3": 1.0, "pra": 4.0, "fant": 5.0, "pr": 3.0, "pa": 3.0, "ra": 2.0,
                 "sog": 1.0, "saves": 3.0, "nhl_blk": 1.0, "hits": 1.0}
@@ -298,13 +310,14 @@ def stat_label(line):
     return ({1: "1H ", 2: "2H "}.get(line.get("half"), "")) + STAT_LABEL[line["stat"]]
 
 
-def _post(payload):
-    if not WEBHOOK_URL:
+def _post(payload, url=None):
+    url = url or WEBHOOK_URL
+    if not url:
         print("no WEBHOOK_URL set, would have posted:", str(payload)[:300])
         return
     for _ in range(4):
         try:
-            r = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+            r = requests.post(url, json=payload, timeout=15)
         except requests.RequestException as e:
             print("discord post failed:", e)
             time.sleep(2)
@@ -935,8 +948,12 @@ def evaluate(line, event, box, prior):
             return None
     elif SCRIPT_ONLY and abs(factor - 1) < SCRIPT_MIN:
         return None
-    if half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1):
-        return None                                  # v1.9.6: never post a pick against the game script
+    caution = half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1)
+    if caution and not CAUTION_ON:
+        return None
+    if caution:                                      # v1.9.8: against the game script -> posted alone, tagged CAUTION
+        notes.insert(0, f"⚠️ CAUTION: the player's pace says {'OVER' if gap > 0 else 'UNDER'}, but the score "
+                        f"(script ×{factor:.2f}) points the other way. Your call.")
     moved = L - prior
     if abs(moved) >= 0.01:
         notes.append(f"PrizePicks line has moved {moved:+g} since pregame (some of the script may already be priced in)")
@@ -946,7 +963,7 @@ def evaluate(line, event, box, prior):
     return {"direction": "OVER" if gap > 0 else "UNDER", "proj": proj, "gap": gap, "cur": c, "line": L,
             "margin": margin, "team": team, "opp": opp, "notes": notes, "factor": factor, "moved": moved,
             "strength": abs(gap) / need * PRIORITY.get(line["stat"], 1.0), "shape": f"{line['sport']}-{shape}", "game": event["id"],
-            "sport": line["sport"]}
+            "sport": line["sport"], "caution": caution}
 
 
 # ====================== TENNIS (v1.7) ======================
@@ -1231,14 +1248,129 @@ def _upcoming(lines):
     return st if 0 < secs <= PRE_WINDOW_H * 3600 else None
 
 
+# ====================== TENNIS PREGAME (v2.1) ======================
+# Two reasons must agree before a tennis pregame pick posts:
+#   1) a simulation of the match built from PrizePicks' OWN Games Won + Total Games lines, and
+#   2) the players' recent form, from the final scores of their last 10 singles matches (free ESPN scoreboards).
+# Props: Total Games Won, Fantasy Score, Total Sets, Total Tie Breaks, 1st Set Total Games.
+# (Total Games itself is what the simulation is built from, so it can't be checked against it. Aces, Double Faults and
+#  Break Points have no free data.)
+T_HIST_DAYS = int(os.getenv("HB_TENNIS_HISTORY_DAYS", "56"))
+T_HIST_STEP = 4                                 # one scoreboard every 4 days catches every tournament
+T_FORM_RATE = float(os.getenv("HB_TENNIS_FORM_RATE", "0.6"))
+T_FORM_GAP = {"t_gw": 1.0, "t_fant": 2.0, "t_sets": 0.1, "t_tb": 0.15, "t_set1": 0.6}
+T_MATCH_STATS = ("t_sets", "t_tb", "t_set1")
+
+
+def _tennis_history_update(budget=2):
+    """Reads past ESPN tennis scoreboards a couple at a time and keeps every finished singles match (compact)."""
+    hist = _state.setdefault("t_hist", {})
+    done = _state.setdefault("t_hist_dates", {})
+    today = datetime.now(_ET) if _ET is not timezone.utc else _now()
+    todo = []
+    for back in range(0, T_HIST_DAYS + 1, T_HIST_STEP):
+        d = (today - timedelta(days=back)).strftime("%Y%m%d")
+        for tour in TENNIS_ESPN:
+            t = done.get((tour, d))
+            fresh = 6 * 3600 if back <= 2 else 10 ** 9      # recent days get re-read; older ones never change
+            if t is None or time.time() - t > fresh:
+                todo.append((back, tour, d))
+    for back, tour, d in sorted(todo)[:budget]:
+        try:
+            data = _get_json(f"{TENNIS_ESPN[tour]}/scoreboard?dates={d}")
+        except Exception as e:
+            print(f"tennis history error ({tour} {d}):", e)
+            done[(tour, d)] = time.time() - 6 * 3600 + 900     # try again in 15 minutes
+            continue
+        for ev in data.get("events", []) or []:
+            comps = list(ev.get("competitions") or [])
+            for g in ev.get("groupings") or []:
+                if "singles" not in str((g.get("grouping") or {}).get("slug", "")):
+                    continue
+                comps += g.get("competitions") or []
+            for c in comps:
+                mid = str(c.get("id") or "")
+                st = ((c.get("status") or {}).get("type") or {})
+                if not mid or mid in hist or st.get("name") != "STATUS_FINAL":
+                    continue                                   # finished normally only (no retirements/walkovers)
+                cs = c.get("competitors") or []
+                if len(cs) != 2 or any(x.get("type") != "athlete" for x in cs):
+                    continue
+                names = [_norm((x.get("athlete") or {}).get("displayName", "")) for x in cs]
+                ls = [[int(_num(v.get("value"))) for v in (x.get("linescores") or [])] for x in cs]
+                n = min(len(ls[0]), len(ls[1]))
+                if n < 2 or n > 3:
+                    continue                                   # best-of-3 only (the model assumes it)
+                sets = [(ls[0][i], ls[1][i]) for i in range(n)]
+                hist[mid] = {"t": _to_dt(c.get("date")) or _now(), "p": names, "sets": sets}
+        done[(tour, d)] = time.time()
+        del data
+    return len(todo) - min(len(todo), budget)
+
+
+def _tennis_player_matches(norm):
+    """This player's last 10 finished singles matches, newest first, from his own side: list of stat dicts."""
+    idx = _state.get("t_name_idx")
+    hist = _state.get("t_hist", {})
+    if not idx or idx[0] != len(hist):
+        by = {}
+        for m in hist.values():
+            for nm in m["p"]:
+                by.setdefault(nm, None)
+        last = {}
+        for nm in by:
+            if nm.split():
+                last.setdefault(nm.split()[-1], []).append(nm)
+        idx = (len(hist), set(by), last)
+        _state["t_name_idx"] = idx
+    _, names, last = idx
+    me = norm if norm in names else None
+    if not me and norm.split():
+        cands = [c for c in last.get(norm.split()[-1], []) if c[:1] == norm[:1]]
+        me = cands[0] if len(cands) == 1 else None
+    if not me:
+        return []
+    rows = []
+    for m in sorted(hist.values(), key=lambda m: m["t"], reverse=True):
+        if me not in m["p"]:
+            continue
+        side = m["p"].index(me)
+        sets = [(a, b) if side == 0 else (b, a) for a, b in m["sets"]]
+        gw, gl = sum(a for a, _ in sets), sum(b for _, b in sets)
+        sw, sl = sum(1 for a, b in sets if a > b), sum(1 for a, b in sets if b > a)
+        rows.append({"t_gw": gw, "t_games": gw + gl, "t_sets": len(sets),
+                     "t_tb": sum(1 for a, b in sets if max(a, b) == 7 and min(a, b) == 6),
+                     "t_set1": sets[0][0] + sets[0][1], "t_fant": 10 + gw - gl + 3 * (sw - sl)})
+        if len(rows) >= 10:
+            break
+    return rows
+
+
+def _t_form_reason(stat, direction, L, vals, who):
+    """(ok, text) for the recent-form reason."""
+    if not vals:
+        return False, ""
+    n = len(vals)
+    avg = sum(vals) / n
+    good = sum(1 for v in vals if (v > L if direction == "OVER" else v < L))
+    side_ok = (avg - L) >= T_FORM_GAP[stat] if direction == "OVER" else (L - avg) >= T_FORM_GAP[stat]
+    ok = side_ok and good / n >= T_FORM_RATE
+    label = {"t_gw": "games won", "t_fant": "fantasy (without aces)", "t_sets": "sets", "t_tb": "tie breaks",
+             "t_set1": "1st-set games"}[stat]
+    return ok, f"{'✅' if ok else '❌'} Recent form ({who}): {label} averaging {avg:.2f}, {direction} {L:g} in {good} of {n}"
+
+
 def tennis_pregame(tb):
-    """Tennis: rebuilds each upcoming match from PrizePicks' own Games Won and Total Games lines, then checks
-    Games Won and Fantasy Score against it. Returns at most one pick per match."""
+    """Tennis pregame picks: the simulation AND recent form must both point the same way. One pick per match."""
+    try:
+        _tennis_history_update()
+    except Exception as e:
+        print("tennis history error:", e)
     groups = {}
     for key, ln in tb.items():
         if ln.get("gid"):
             groups.setdefault(ln["gid"], {}).setdefault(ln["norm"], {})[ln["stat"]] = (key, ln)
-    out = []
+    out, checked, no_form = [], 0, 0
     for gid, pl in groups.items():
         if len(pl) != 2:
             continue
@@ -1254,53 +1386,86 @@ def tennis_pregame(tb):
             continue
         share = _cl(gwA / (gwA + gwB), 0.25, 0.75)
         ck = "P" + str(gid)
-        if ck not in _state["tcal"]:
-            _state["tcal"][ck] = (tg, gwA, gwB, _calibrate_hold(share, tg))
-        if _state["tcal"][ck][:3] != (tg, gwA, gwB):               # lines changed: recalibrate
+        if ck not in _state["tcal"] or _state["tcal"][ck][:3] != (tg, gwA, gwB):
             _state["tcal"][ck] = (tg, gwA, gwB, _calibrate_hold(share, tg))
         base = _state["tcal"][ck][3]
         d = share - 0.5
         st0 = {"sw": (0, 0), "g_done": (0, 0), "tbs": 0, "ns": 0, "set1": None, "cur": (0, 0)}
         sims = _sim(st0, _cl(base + d), _cl(base - d), _cl(0.5 + d, 0.1, 0.9), T_BEST_OF, T_SIMS)
         name_a, name_b = A[next(iter(A))][1]["name"], B[next(iter(B))][1]["name"]
-        best = None
+        form = {0: _tennis_player_matches(pa), 1: _tennis_player_matches(pb)}
+        checked += 1
+        if len(form[0]) < 5 or len(form[1]) < 5:
+            no_form += 1
+        cands = []                                              # (side, stat, key, ln)
         for side, D in ((0, A), (1, B)):
             for stat in ("t_gw", "t_fant"):
-                if stat not in D:
+                if stat in D:
+                    cands.append((side, stat) + D[stat])
+        for stat in T_MATCH_STATS:                              # same number for both players: check once
+            if stat in A:
+                cands.append((0, stat) + A[stat])
+            elif stat in B:
+                cands.append((1, stat) + B[stat])
+        best = None
+        for side, stat, key, ln in cands:
+            adj = 0.0
+            if stat == "t_fant":
+                adj = _serve_adj(ln["norm"])
+                if adj is None:
+                    continue                                    # no Aces line: can't price the serve part fairly
+            Lv = ln["line"]
+            vals = [_t_val(stat, side, s_, adj) for s_ in sims]
+            n = len(vals)
+            p_over = sum(1 for v in vals if v > Lv) / n
+            p_under = sum(1 for v in vals if v < Lv) / n
+            direction, prob = ("OVER", p_over) if p_over >= p_under else ("UNDER", p_under)
+            need = PRE_MIN_PROB + (T_FANT_EXTRA if stat == "t_fant" else 0.0)
+            if prob < need:
+                continue
+            # reason 2: recent form
+            if stat in T_MATCH_STATS:
+                if len(form[0]) < 4 or len(form[1]) < 4:
                     continue
-                key, ln = D[stat]
-                adj = 0.0
-                if stat == "t_fant":
-                    adj = _serve_adj(ln["norm"])
-                    if adj is None:
-                        continue                                   # no Aces line: can't price the serve part fairly
-                Lv = ln["line"]
-                vals = [_t_val(stat, side, s, adj) for s in sims]
-                n = len(vals)
-                p_over = sum(1 for v in vals if v > Lv) / n
-                p_under = sum(1 for v in vals if v < Lv) / n
-                direction, prob = ("OVER", p_over) if p_over >= p_under else ("UNDER", p_under)
-                need = PRE_MIN_PROB + (T_FANT_EXTRA if stat == "t_fant" else 0.0)
-                if prob < need:
+                fv = [r[stat] for r in form[0]] + [r[stat] for r in form[1]]
+                ok, ftxt = _t_form_reason(stat, direction, Lv, fv, f"both players' last {len(fv)} matches combined")
+            else:
+                mine = form[side]
+                if len(mine) < 5:
                     continue
-                proj = sum(vals) / n
-                notes = [f"Hits {direction} in {prob:.0%} of {n} simulated matches built from PrizePicks' other lines"]
-                if stat == "t_gw":
-                    notes.append(f"Games Won lines: {name_a} {gwA:g} + {name_b} {gwB:g} = {gwA + gwB:g}, "
-                                 f"but Total Games is {tg:g}")
-                else:
-                    notes.append(f"Fantasy = 10 + games won − games lost + 3 × (sets won − sets lost) + aces/double faults "
-                                 f"({adj:+.1f} from the Aces line)")
-                notes.append("Pregame check: no live data yet, so injuries and late news aren't known")
-                a = {"direction": direction, "proj": proj, "gap": proj - Lv, "cur": 0, "line": Lv, "margin": 0,
-                     "team": {}, "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": prob,
-                     "strength": prob / need, "shape": "PRE-pregame", "game": "TP" + str(gid), "pre": True,
-                     "score_txt": f"Starts {_start_txt(start)}"}
-                ev = {"id": "TP" + str(gid), "name": f"{name_a} vs {name_b}", "f": 0.0, "period": 0, "clock_txt": ""}
-                if best is None or prob > best[3]["prob"]:
-                    best = (key, ln, ev, a)
+                fv = [r[stat] + (adj if stat == "t_fant" else 0) for r in mine]
+                ok, ftxt = _t_form_reason(stat, direction, Lv, fv, f"{ln['name']}'s last {len(fv)}")
+            if not ok:
+                continue
+            proj = sum(vals) / n
+            notes = [f"✅ Simulation from PrizePicks' own lines: {direction} {Lv:g} in {prob:.0%} of {n} matches", ftxt]
+            if stat == "t_gw":
+                notes.append(f"Games Won lines: {name_a} {gwA:g} + {name_b} {gwB:g} = {gwA + gwB:g}, Total Games {tg:g}")
+            elif stat == "t_fant":
+                notes.append(f"Fantasy = 10 + games won − games lost + 3 × (sets won − sets lost) + aces/double faults "
+                             f"({adj:+.1f} from the Aces line)")
+            elif stat == "t_sets":
+                notes.append("Over 2.5 sets = the match goes to a 3rd set")
+            elif stat == "t_tb":
+                notes.append("A tie break = a set that reaches 6-6")
+            if stat not in T_MATCH_STATS:
+                notes.append("Last matches: " + ", ".join(f"{v:g}" for v in fv))
+            notes.append("Recent form is against different opponents, so it's a guide, not a promise")
+            notes.append("If a player retires, PrizePicks keeps the stats so far: a risk for overs")
+            a = {"direction": direction, "proj": proj, "gap": proj - Lv, "cur": 0, "line": Lv, "margin": 0,
+                 "team": {}, "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": prob,
+                 "strength": prob / need, "shape": "PRE-pregame", "game": "TP" + str(gid), "pre": True,
+                 "sport": "TENNIS", "score_txt": f"Starts {_start_txt(start)}"}
+            ev = {"id": "TP" + str(gid), "name": f"{name_a} vs {name_b} — 2 reasons agree", "f": 0.0, "period": 0,
+                  "clock_txt": ""}
+            if best is None or prob > best[3]["prob"]:
+                best = (key, ln, ev, a)
         if best:
             out.append(best)
+    if time.time() - _state.get("t_pre_log_t", 0) > 3600:
+        _state["t_pre_log_t"] = time.time()
+        print(f"TENNIS PREGAME CHECK: {checked} upcoming matches, {no_form} without 5+ recent matches for both players, "
+              f"{len(out)} picks | {len(_state.get('t_hist', {}))} past matches loaded")
     return out
 
 
@@ -1364,6 +1529,381 @@ def nba_pregame(board, sport="NBA", combos=NBA_COMBOS, gap_min=None, pct=0.08):
     return out
 
 
+# ====================== NHL PREGAME GOALIE SAVES (v1.9.9) ======================
+NHL_SAVES_MIN_PROB = float(os.getenv("HB_SAVES_MIN_PROB", "0.66"))   # pick must hit in 66%+ by the model
+NHL_SAVES_MIN_GAP = float(os.getenv("HB_SAVES_MIN_GAP", "3.0"))      # and be 3+ saves away from the line
+NHL_SV_LEAGUE = 0.902                                               # league save percentage
+NHL_TEAM_ALIAS = {"LAK": "LA", "NJD": "NJ", "SJS": "SJ", "TBL": "TB", "WAS": "WSH", "MON": "MTL", "NAS": "NSH",
+                  "CLS": "CBJ", "UTA": "UTAH", "UTH": "UTAH", "VEG": "VGK", "LV": "VGK", "WIN": "WPG", "CAL": "CGY",
+                  "PHX": "UTAH", "ARI": "UTAH", "NYIS": "NYI"}
+
+
+def _nhl_season_year():
+    n = datetime.now(_ET) if _ET is not timezone.utc else _now()
+    return n.year + 1 if n.month >= 9 else n.year                 # the 2026-27 season is "2027" at ESPN
+
+
+def nhl_team_stats():
+    """Shots taken / shots allowed per game and save % for every NHL team: this season blended with last season
+    (early in the season a few games say little). Read from ESPN at most every 6 hours."""
+    cached = _state.get("nhl_ts")
+    if cached and time.time() - cached[0] < (6 * 3600 if cached[1] else 1800):
+        return cached[1]
+    out = {}
+    try:
+        teams = _get_json(ESPN["NHL"] + "/teams")["sports"][0]["leagues"][0]["teams"]
+        y = _nhl_season_year()
+        for t in teams:
+            tm = t.get("team") or {}
+            tid = str(tm.get("id"))
+            per = {}
+            for yr in (y, y - 1):
+                try:
+                    d = _get_json(f"{ESPN['NHL']}/teams/{tid}/statistics?season={yr}&seasontype=2")
+                except Exception:
+                    continue
+                vals = {}
+                for cat in ((d.get("results") or {}).get("stats") or {}).get("categories", []) or []:
+                    for st in cat.get("stats", []) or []:
+                        vals[st.get("name")] = _num(st.get("value"))
+                gp = vals.get("games", 0)
+                if gp > 0:
+                    per[yr] = (gp, vals.get("shotsTotal", 0) / gp, vals.get("shotsAgainst", 0) / gp, vals.get("savePct", 0))
+            if not per:
+                continue
+            cur, last = per.get(y), per.get(y - 1)
+            if cur and last:
+                w = cur[0] / (cur[0] + 15.0)                     # this season counts fully after ~15+ games
+                sf, sa = w * cur[1] + (1 - w) * last[1], w * cur[2] + (1 - w) * last[2]
+                sv = w * cur[3] + (1 - w) * last[3]
+            else:
+                one = cur or last
+                sf, sa, sv = one[1], one[2], one[3]
+            names = {tm.get("abbreviation", ""), tm.get("shortDisplayName", ""), tm.get("name", ""),
+                     tm.get("location", ""), tm.get("displayName", "")}
+            out[tid] = {"abbr": tm.get("abbreviation", ""), "name": tm.get("displayName", ""), "sf": sf, "sa": sa,
+                        "sv": sv or NHL_SV_LEAGUE, "keys": {re.sub(r"[^A-Z]", "", n.upper()) for n in names if n},
+                        "gp": cur[0] if cur else 0}
+    except Exception as e:
+        print("NHL team stats error:", e)
+    _state["nhl_ts"] = (time.time(), out)
+    if out:
+        print(f"NHL TEAM STATS: {len(out)} teams loaded (season {_nhl_season_year()} blended with last season)")
+    return out
+
+
+def _nhl_team(ts, txt):
+    k = re.sub(r"[^A-Z]", "", str(txt or "").upper())
+    if not k:
+        return None
+    k = NHL_TEAM_ALIAS.get(k, k)
+    for tid, t in ts.items():
+        if k == t["abbr"] or k in t["keys"]:
+            return tid
+    for tid, t in ts.items():                                       # "Tampa Bay Lightning", "TB Lightning" ...
+        if any(len(x) > 3 and x in k for x in t["keys"]):
+            return tid
+    return None
+
+
+def _norm_cdf(x):
+    import math
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def nhl_saves_pregame(board):
+    """Goalie Saves before puck drop: expected shots on the goalie = (his team's shots allowed) x (the other team's
+    shots taken) / league average, times a save %. Posts only when the line is clearly off."""
+    lines = [(k, ln) for k, ln in board.items() if ln["sport"] == "NHL" and ln["stat"] == "saves"
+             and not ln["live"] and ln["line"] > 0 and _upcoming([ln])]
+    if not lines and not any(ln["sport"] == "NHL" and ln["stat"] == "saves_combo" for ln in board.values()):
+        return []
+    ts = nhl_team_stats()
+    if not ts:
+        return []
+    lg_sf = sum(t["sf"] for t in ts.values()) / len(ts)
+    out, miss = [], []
+
+    def model(gl):
+        """(expected saves, spread, expected shots, his team, other team) for one goalie's line, or None."""
+        mine, opp = _nhl_team(ts, gl["team"]), _nhl_team(ts, gl["opp"])
+        if not mine or not opp or mine == opp:
+            return None
+        A, B = ts[mine], ts[opp]
+        shots = A["sa"] * B["sf"] / lg_sf
+        sv = 0.7 * NHL_SV_LEAGUE + 0.3 * A["sv"]                    # team save % counts a little; one bad week says little
+        mu = shots * sv
+        return mu, max(5.0, 0.22 * mu), shots, A, B
+
+    for key, ln in lines:
+        m = model(ln)
+        if not m:
+            miss.append(f"{ln['name']} ({ln['team']} vs {ln['opp']})")
+            continue
+        mu, sd, shots, A, B = m
+        _state.setdefault("saves_model", {})[ln["norm"]] = (mu, shots, A, B, lg_sf)
+        continue                                        # v2.0: singles post through the recent-form check (2+ reasons)
+        L = ln["line"]
+        p_over = 1 - _norm_cdf((L - mu) / sd)
+        direction, prob = ("OVER", p_over) if mu > L else ("UNDER", 1 - p_over)
+        gap = mu - L
+        if prob < NHL_SAVES_MIN_PROB or abs(gap) < NHL_SAVES_MIN_GAP:
+            continue
+        start = _upcoming([ln])
+        notes = [f"{B['abbr']} take {B['sf']:.1f} shots a game, {A['abbr']} allow {A['sa']:.1f} (league average {lg_sf:.1f})",
+                 f"Expected about {shots:.0f} shots on him and {mu:.1f} saves (hits {direction} about {prob:.0%} by this model)",
+                 "Pregame check: confirm he is the STARTING goalie before you lock",
+                 "If he gets pulled early, saves stop counting: a risk for overs"]
+        if A.get("gp", 0) < 10:
+            notes.append(f"Early season: this year's numbers ({int(A.get('gp', 0))} games) are blended with last season")
+        a = {"direction": direction, "proj": mu, "gap": gap, "cur": 0, "line": L, "margin": 0, "team": {}, "opp": {},
+             "notes": notes, "factor": 1.0, "moved": 0.0, "prob": prob, "strength": prob / NHL_SAVES_MIN_PROB,
+             "shape": "PRE-pregame", "game": "GS" + str(ln.get("gid") or ln["norm"]), "pre": True, "sport": "NHL",
+             "score_txt": f"{A['abbr']} vs {B['abbr']} • starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} ({A['name']}) — Goalie Saves", "f": 0.0, "period": 0, "clock_txt": ""}
+        out.append((key, ln, ev, a))
+    # v1.9.9: Goalie Saves (Combo): two goalies added together. Each goalie needs his own single saves line on the
+    # board (that's how the bot knows his team and opponent).
+    singles = {ln["norm"]: ln for _, ln in lines}
+    singles.update({ln["norm"]: ln for k, ln in board.items() if ln["sport"] == "NHL" and ln["stat"] == "saves"})
+    combos = [(k, ln) for k, ln in board.items() if ln["sport"] == "NHL" and ln["stat"] == "saves_combo"
+              and not ln["live"] and ln["line"] > 0 and _upcoming([ln])]
+    n_combo_ok = 0
+    for key, ln in combos:
+        parts = [_norm(x) for x in re.split(r"\s*(?:\+|/|&|,)\s*", ln["name"]) if x.strip()]
+        ms = [model(singles[p]) if p in singles else None for p in parts]
+        if len(parts) < 2 or not all(ms):
+            miss.append(f"combo {ln['name']}")
+            continue
+        n_combo_ok += 1
+        mu = sum(m[0] for m in ms)
+        sd = sum(m[1] ** 2 for m in ms) ** 0.5
+        L = ln["line"]
+        forms = [_nhl_form_values(p, _nhl_team(ts, singles[p]["team"]), "saves") for p in parts]
+        if not all(f and len(f) >= 4 for f in forms):
+            continue                                    # v2.0: need each goalie's recent starts too (2nd reason)
+        form_sum = sum(sum(f) / len(f) for f in forms)
+        if (form_sum - L) * (mu - L) <= 0 or abs(form_sum - L) < NHL_SAVES_MIN_GAP:
+            continue                                    # recent starts don't agree with the matchup model
+        p_over = 1 - _norm_cdf((L - mu) / sd)
+        direction, prob = ("OVER", p_over) if mu > L else ("UNDER", 1 - p_over)
+        gap = mu - L
+        if prob < NHL_SAVES_MIN_PROB or abs(gap) < NHL_SAVES_MIN_GAP:
+            continue
+        start = _upcoming([ln])
+        notes = [" + ".join(f"{singles[p]['name']} about {m[0]:.1f} ({m[3]['abbr']} vs {m[4]['abbr']}, ~{m[2]:.0f} shots)"
+                            for p, m in zip(parts, ms)) + f" = {mu:.1f} saves",
+                 f"✅ Recent starts agree: their averages add up to {form_sum:.1f}",
+                 f"Hits {direction} about {prob:.0%} by this model",
+                 "Pregame check: BOTH must be the starting goalies, or the combo can go DNP",
+                 "If either gets pulled early, his saves stop counting: a risk for overs"]
+        a = {"direction": direction, "proj": mu, "gap": gap, "cur": 0, "line": L, "margin": 0, "team": {}, "opp": {},
+             "notes": notes, "factor": 1.0, "moved": 0.0, "prob": prob, "strength": prob / NHL_SAVES_MIN_PROB,
+             "shape": "PRE-pregame", "game": "GC" + str(ln.get("gid") or ln["norm"]), "pre": True, "sport": "NHL",
+             "score_txt": f"starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} — Goalie Saves (Combo)", "f": 0.0, "period": 0, "clock_txt": ""}
+        out.append((key, ln, ev, a))
+    if time.time() - _state.get("saves_log_t", 0) > 3600:
+        _state["saves_log_t"] = time.time()
+        print(f"NHL SAVES CHECK: {len(lines)} goalie lines + {len(combos)} combos before puck drop, "
+              f"{n_combo_ok} combos matched, "
+              f"{len(out)} picks" + (f" | could not match: {', '.join(miss)[:400]}" if miss else ""))
+    return out
+
+
+# ====================== NHL PREGAME RECENT FORM (v2.0) ======================
+FORM_STATS = ("sog", "hits", "nhl_blk", "fow", "toi", "saves", "nhl_fant")
+FORM_MIN_GAP = {"sog": 0.6, "hits": 0.8, "nhl_blk": 0.6, "fow": 1.5, "toi": 1.2, "saves": 3.0, "nhl_fant": 2.5}
+FORM_RATE = float(os.getenv("HB_FORM_RATE", "0.7"))         # 7 of the last 10 games over (or under) the line
+FORM_GAMES = 10
+FORM_MIN_PLAYED = 5
+FORM_FETCH_PER_CYCLE = int(os.getenv("HB_FORM_FETCH_PER_CYCLE", "12"))   # box scores read per cycle (keeps live fast)
+
+
+def _nhl_team_games(tid):
+    """A team's last 10 finished games (newest first) from its ESPN schedule. Refreshed every 3 hours."""
+    sc = _state.setdefault("nhl_sched", {})
+    hit = sc.get(tid)
+    if hit and time.time() - hit[0] < 3 * 3600:
+        return hit[1]
+    games = []
+    try:
+        d = _get_json(f"{ESPN['NHL']}/teams/{tid}/schedule")
+        now = _now()
+        for ev in d.get("events", []) or []:
+            dt = _to_dt(ev.get("date"))
+            if dt and (now - dt).total_seconds() > 4 * 3600:       # started 4+ hours ago: finished
+                games.append((dt, str(ev.get("id"))))
+    except Exception as e:
+        print(f"NHL schedule error ({tid}):", e)
+        return hit[1] if hit else []
+    games.sort(reverse=True)
+    out = [eid for _, eid in games[:FORM_GAMES]]
+    sc[tid] = (time.time(), out)
+    return out
+
+
+def _nhl_game_box(eid):
+    """Every player's line from one finished NHL game (cached; finished games don't change). None if not read yet."""
+    cache = _state.setdefault("nhl_box", {})
+    if eid in cache:
+        return cache[eid]
+    if _state.get("form_budget", 0) <= 0:
+        return None
+    _state["form_budget"] -= 1
+    try:
+        d = _get_json(f"{ESPN['NHL']}/summary?event={eid}")
+    except Exception:
+        return None
+    comp = ((d.get("header") or {}).get("competitions") or [{}])[0]
+    if not (((comp.get("status") or {}).get("type") or {}).get("completed")):
+        return None
+    winner = next((str((c.get("team") or {}).get("id")) for c in comp.get("competitors", []) if c.get("winner")), None)
+    players = {}
+    for team in (d.get("boxscore") or {}).get("players", []) or []:
+        tid = str((team.get("team") or {}).get("id"))
+        for cat in team.get("statistics", []) or []:
+            keys = cat.get("keys") or cat.get("labels") or []
+            goalie = (cat.get("name") or "").lower() == "goalies"
+            for ath in cat.get("athletes", []) or []:
+                nm = _norm((ath.get("athlete") or {}).get("displayName", ""))
+                vals = ath.get("stats") or []
+                if not nm or len(vals) != len(keys):
+                    continue
+                row = dict(zip(keys, vals))
+                if goalie:
+                    toi = _clock_seconds(row.get("timeOnIce")) / 60.0
+                    win = 1.0 if (winner == tid and toi >= 40) else 0.0
+                    sv, ga = _num(row.get("saves")), _num(row.get("goalsAgainst"))
+                    players[nm] = {"goalie": True, "start": toi >= 40, "saves": sv,
+                                   "nhl_fant": 6 * win + 0.6 * sv - 3 * ga, "team": tid}
+                else:
+                    g, a_ = _num(row.get("goals")), _num(row.get("assists"))
+                    sog, hits, blk = _num(row.get("shotsTotal")), _num(row.get("hits")), _num(row.get("blockedShots"))
+                    toi = _clock_seconds(row.get("timeOnIce")) / 60.0
+                    if toi <= 0:
+                        continue
+                    players[nm] = {"sog": sog, "hits": hits, "nhl_blk": blk, "fow": _num(row.get("faceoffsWon")),
+                                   "toi": toi, "nhl_fant": 6 * g + 4 * a_ + sog + 0.5 * hits + blk, "team": tid}
+    cache[eid] = players
+    return players
+
+
+def _nhl_form_values(norm, tid, stat):
+    """The player's numbers for this stat in his team's last 10 games (newest first). Goalies: starts only.
+    None if the box scores aren't all read yet."""
+    if not tid:
+        return None
+    vals = []
+    for eid in _nhl_team_games(tid):
+        box = _nhl_game_box(eid)
+        if box is None:
+            return None                                       # still reading box scores: try next cycle
+        r = box.get(norm)
+        if not r or stat not in r:
+            continue
+        _state.setdefault("is_goalie", {})[norm] = bool(r.get("goalie"))
+        if r.get("goalie") and not r.get("start"):
+            continue
+        vals.append(r[stat])
+    return vals
+
+
+def nhl_form_pregame(board):
+    """Pregame NHL picks from recent form. Posts only when 2+ reasons agree:
+    must have BOTH (a) 7+ of the last 10 games on the same side of the line and (b) a clear average gap,
+    plus at least one of (c) the matchup and (d) the last 5 games."""
+    lines = [(k, ln) for k, ln in board.items() if ln["sport"] == "NHL" and ln["stat"] in FORM_STATS
+             and not ln["live"] and ln["line"] > 0 and _upcoming([ln])]
+    if not lines:
+        return []
+    ts = nhl_team_stats()
+    if not ts:
+        return []
+    lg_sa = sum(t["sa"] for t in ts.values()) / len(ts)
+    lg_sf = sum(t["sf"] for t in ts.values()) / len(ts)
+    out, waiting, checked = [], 0, 0
+    for key, ln in lines:
+        mine, opp = _nhl_team(ts, ln["team"]), _nhl_team(ts, ln["opp"])
+        if not mine:
+            continue
+        stat, L = ln["stat"], ln["line"]
+        vals = _nhl_form_values(ln["norm"], mine, stat)
+        if vals is None:
+            waiting += 1
+            continue
+        checked += 1
+        if len(vals) < (4 if stat in ("saves",) else FORM_MIN_PLAYED):
+            continue
+        is_goalie = stat == "saves" or bool(_state.get("is_goalie", {}).get(ln["norm"]))
+        n = len(vals)
+        avg = sum(vals) / n
+        direction = "OVER" if avg > L else "UNDER"
+        hits_n = sum(1 for v in vals if (v > L if direction == "OVER" else v < L))
+        pushes = sum(1 for v in vals if v == L)
+        rate = hits_n / n
+        need = max(FORM_MIN_GAP[stat], 0.12 * L)
+        reasons = []
+        r1 = rate >= FORM_RATE
+        r2 = abs(avg - L) >= need
+        if not (r1 and r2):
+            continue
+        reasons.append(f"✅ {hits_n} of his last {n} {'starts' if is_goalie else 'games'} went {direction} {L:g}")
+        reasons.append(f"✅ Averaging {avg:.1f} vs a line of {L:g}")
+        r3 = False
+        if opp:
+            O = ts[opp]
+            if stat in ("sog",) or (stat == "nhl_fant" and not is_goalie):
+                ratio = O["sa"] / lg_sa
+                if (direction == "OVER" and ratio >= 1.06) or (direction == "UNDER" and ratio <= 0.94):
+                    r3 = True
+                    reasons.append(f"✅ {O['abbr']} allow {O['sa']:.1f} shots a game (league {lg_sa:.1f})")
+            elif stat == "nhl_blk":
+                ratio = O["sf"] / lg_sf
+                if (direction == "OVER" and ratio >= 1.06) or (direction == "UNDER" and ratio <= 0.94):
+                    r3 = True
+                    reasons.append(f"✅ {O['abbr']} take {O['sf']:.1f} shots a game (league {lg_sf:.1f}): "
+                                   f"{'more' if direction == 'OVER' else 'fewer'} shots to block")
+            elif is_goalie:
+                sm = _state.get("saves_model", {}).get(ln["norm"])
+                if sm and ((sm[0] > L + 2) if direction == "OVER" else (sm[0] < L - 2)) and stat == "saves":
+                    r3 = True
+                    reasons.append(f"✅ Matchup: about {sm[1]:.0f} shots expected on him ({sm[3]['abbr']} take "
+                                   f"{sm[3]['sf']:.1f}, {sm[2]['abbr']} allow {sm[2]['sa']:.1f})")
+        last5 = vals[:5]
+        l5 = sum(last5) / len(last5)
+        r4 = len(last5) >= 4 and ((l5 - L) if direction == "OVER" else (L - l5)) >= 0.5 * need
+        if r4:
+            reasons.append(f"✅ Last {len(last5)}: averaging {l5:.1f}")
+        if not (r3 or r4):
+            continue
+        notes = reasons + [f"Last {n}: " + ", ".join(f"{v:g}" if stat != "toi" else f"{v:.1f}" for v in vals)]
+        if is_goalie:
+            notes.append("Confirm he is the STARTING goalie (a goalie who doesn't start is DNP)")
+        if stat == "nhl_fant" and not is_goalie:
+            notes.append("Fantasy from free box scores leaves out power play points (0.5 each): a tiny bit low")
+        if float(L).is_integer():
+            notes.append(f"Whole-number line: exactly {L:g} is a push")
+        if pushes:
+            notes.append(f"{pushes} of the last {n} landed exactly on {L:g}")
+        start = _upcoming([ln])
+        n_reasons = 2 + int(r3) + int(r4)
+        a = {"direction": direction, "proj": avg, "gap": avg - L, "cur": 0, "line": L, "margin": 0, "team": {},
+             "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": rate,
+             "strength": rate / FORM_RATE * (1 + 0.15 * (n_reasons - 3)), "shape": "PRE-pregame",
+             "game": "NG" + str(ln.get("gid") or ln["team"]), "pre": True, "sport": "NHL", "form": True,
+             "score_txt": f"{ts[mine]['abbr']} vs {ts[opp]['abbr'] if opp else ln['opp']} • starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} ({ts[mine]['name']}) — {n_reasons} reasons agree", "f": 0.0,
+              "period": 0, "clock_txt": ""}
+        out.append((key, ln, ev, a))
+    if time.time() - _state.get("form_log_t", 0) > 3600 or (waiting == 0 and not _state.get("form_logged_ready")):
+        _state["form_log_t"] = time.time()
+        _state["form_logged_ready"] = waiting == 0
+        print(f"NHL FORM CHECK: {len(lines)} pregame lines, {checked} checked, {waiting} still loading box scores, "
+              f"{len(out)} picks ({len(_state.get('nhl_box', {}))} box scores cached)")
+    return out
+
+
 def _pre_room():
     now = time.time()
     _state["pre_times"] = [t for t in _state["pre_times"] if now - t < 3600]
@@ -1377,12 +1917,17 @@ def _room():
     return len(_state["sent"]) < MAX_PER_HOUR
 
 
-def _can_alert(key, direction):
+def _can_alert(key, direction, game=None, line=None):
+    """v1.9.8: the same player + stat + lean posts again only when PrizePicks shows a DIFFERENT number
+    (each new line is a new pick), and never twice at the same number in one game."""
     if not _room():
         return False
     last = _state["alerts"].get(key)
-    if last and last[1] == direction and time.time() - last[0] < COOLDOWN:
-        return False
+    if last and last[1] == direction:
+        if game is not None and len(last) > 3 and last[2] == game:
+            return line is not None and line != last[3]
+        if time.time() - last[0] < COOLDOWN:
+            return False
     return True
 
 
@@ -1397,9 +1942,20 @@ def _score_text(event, a):
     return f"{t['abbr'] or t['name']} {t['score']} - {o['score']} {o['abbr'] or o['name']} • {'P' if a.get('sport') == 'NHL' else 'Q'}{event['period']} {event['clock_txt']}"
 
 
+def _pick_line(line, a):
+    """v2.1: the pick in PrizePicks words, first line of every pregame post."""
+    word = "MORE" if a["direction"] == "OVER" else "LESS"
+    arrow = "⬆️" if a["direction"] == "OVER" else "⬇️"
+    return f"👉 **PICK: {word} ({a['direction']}) {line['line']:g} {stat_label(line)}** {arrow}\n"
+
+
 def _leg_text(line, a):
+    if a.get("form"):
+        return (_pick_line(line, a) + f"**{line['name']}** — {stat_label(line)} **{line['line']:g}** → **{a['direction']}**\n"
+                f"Recent average **{a['proj']:.1f}** (gap {a['gap']:+.1f})\n"
+                + "\n".join(f"• {n}" for n in a["notes"]))
     if a.get("pre"):
-        return (f"**{line['name']}** — {stat_label(line)} **{line['line']:g}** → **{a['direction']}**\n"
+        return (_pick_line(line, a) + f"**{line['name']}** — {stat_label(line)} **{line['line']:g}** → **{a['direction']}**\n"
                 f"Fair value from the other lines **{a['proj']:.1f}** (gap {a['gap']:+.1f})\n"
                 + "\n".join(f"• {n}" for n in a["notes"]))
     return (f"**{line['name']}** — {stat_label(line)} **{line['line']:g}** → **{a['direction']}**\n"
@@ -1408,7 +1964,7 @@ def _leg_text(line, a):
 
 
 def _mark_sent(key, a):
-    _state["alerts"][key] = (time.time(), a["direction"])
+    _state["alerts"][key] = (time.time(), a["direction"], a.get("game"), a.get("line"))
     _state["pending"].pop(key, None)
     if a.get("pre"):
         _state["pre_sent"][key] = a["line"]                   # posted once at this line; again only if the line changes
@@ -1419,14 +1975,16 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v1.9.7 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v2.1 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
-    embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — LEAN {a['direction']}",
-             "description": _leg_text(line, a), "color": 3066993 if a["direction"] == "OVER" else 3447003,
+    lean = ("⚠️ CAUTION — LEAN " if a.get("caution") else "LEAN ") + a["direction"]
+    color = 15105570 if a.get("caution") else (3066993 if a["direction"] == "OVER" else 3447003)
+    embed = {"title": f"{_emoji(a)} Heartbeat — {line['sport']}{tag} — {lean}",
+             "description": _leg_text(line, a), "color": color,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
              "footer": {"text": footer}}
-    _post({"embeds": [embed]})
-    print(f"ALERT(single) {line['sport']} {line['name']} {line.get('half') or 'full'} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
+    _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if a.get("pre") else None)
+    print(f"ALERT(single{', CAUTION' if a.get('caution') else ''}) {line['sport']} {line['name']} {line.get('half') or 'full'} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
           f"{a['direction']} cur {a['cur']} margin {a['margin']} f={event['f']:.2f}")
 
 
@@ -1445,8 +2003,8 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v1.9.7 • alert only • projections, not guarantees"}}
-    _post({"embeds": [embed]})
+             "footer": {"text": "Model v2.1 • alert only • projections, not guarantees"}}
+    _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
 
 
@@ -1462,11 +2020,17 @@ def process_candidates(fresh):
         if c[3].get("pre"):
             if _state["pre_sent"].get(c[0]) == c[3]["line"] or not _pre_room():
                 continue                               # already posted at this line, or the pregame hourly cap is reached
-        if not _can_alert(c[0], c[3]["direction"]):
+        if not _can_alert(c[0], c[3]["direction"], None if c[3].get("pre") else c[3].get("game"), c[3].get("line")):
             continue
         _state["pending"].setdefault(c[0], now)
         ready.append(c)
     posted = 0
+    for c in [c for c in ready if c[3].get("caution")]:      # CAUTION picks: alone, right away, never in a pair
+        if not _room():
+            break
+        send_single(c, label="caution: pace vs score")
+        posted += 1
+    ready = [c for c in ready if not c[3].get("caution")]
     if not PAIR_MODE:
         for c in ready:
             if not _room():
@@ -1539,7 +2103,8 @@ def discovery_report(board, live):
              f"PrizePicks attribute names seen: {', '.join(sorted(_state['keys_seen'])) or 'none yet'}",
              f"Status/odds flags seen: {flags or 'none'}"]
     lines.append("Tennis alerts: " + (f"ON (only picks that hit in {T_MIN_PROB:.0%}+ of simulations)" if TENNIS_ON else "off"))
-    lines.append("Pregame line check: " + (f"ON (max {PRE_MAX_LEGS} picks an hour)" if PREGAME_ON else "off"))
+    lines.append("Pregame line check: " + (f"ON (max {PRE_MAX_LEGS} picks an hour)" if PREGAME_ON else "off")
+                 + (" → posts to the PREGAME channel" if PREGAME_WEBHOOK_URL else " → same channel (no PREGAME_WEBHOOK_URL yet)"))
     lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
@@ -1767,7 +2332,9 @@ def cycle(first=False):
     pre_fresh = []
     if PREGAME_ON:
         try:
-            pre_fresh = all_combo_pregame(board) + (tennis_pregame(_state["tboard"]) if TENNIS_ON else [])
+            _state["form_budget"] = FORM_FETCH_PER_CYCLE
+            pre_fresh = all_combo_pregame(board) + (nhl_saves_pregame(board) + nhl_form_pregame(board)
+                                                    if "NHL" in SPORTS else []) + (tennis_pregame(_state["tboard"]) if TENNIS_ON else [])
         except Exception as e:                      # the pregame check can never stop live alerts
             print("pregame error:", e)
     fresh += pre_fresh
@@ -1782,7 +2349,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v1.9.7 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v2.1 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
