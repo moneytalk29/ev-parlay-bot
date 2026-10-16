@@ -1,4 +1,4 @@
-"""Heartbeat v2.4: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v2.7: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -1936,6 +1936,309 @@ def nhl_form_pregame(board):
     return out
 
 
+# ====================== ESPORTS PREGAME (v2.6, free) ======================
+# Valorant, LoL and CS2: a "(Combo)" kills line (2-3 players added together) is checked against the sum of the
+# same players' single lines. Only PrizePicks' own lines are used (no paid esports data).
+ES_LEAGUES = ("CS2", "CSGO", "CS", "LOL", "LEAGUE OF LEGENDS", "VAL", "VALORANT")
+ES_ON = os.getenv("HB_ESPORTS", "true").lower() == "true"
+ES_GAP_MIN = float(os.getenv("HB_ES_GAP_MIN", "5"))          # combo must be 5+ kills away from the sum
+ES_GAP_PCT = float(os.getenv("HB_ES_GAP_PCT", "0.035"))      # ...and 3.5%+ of the line
+
+
+def _es_league(name):
+    n = (name or "").upper()
+    if n in ("CS2", "CSGO", "CS"):
+        return "CS2"
+    if n in ("LOL", "LEAGUE OF LEGENDS"):
+        return "LOL"
+    if n in ("VAL", "VALORANT"):
+        return "VAL"
+    return None
+
+
+def esports_pregame(raw):
+    players, leagues = {}, {}
+    for inc in raw.get("included", []) or []:
+        a = inc.get("attributes", {}) or {}
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = (a.get("name", ""), a.get("team") or a.get("team_name") or "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    singles, combos = {}, []
+    for item in raw.get("data", []) or []:
+        try:
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            lg = _es_league(leagues.get((rel.get("league", {}).get("data") or {}).get("id"), ""))
+            if not lg or str(a.get("odds_type") or "standard").lower() != "standard":
+                continue
+            if item.get("_live_feed"):
+                continue
+            stat_raw = re.sub(r"\s+", " ", str(a.get("stat_display_name") or a.get("stat_type") or "")).strip()
+            name, team = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), ("", ""))
+            line = _num(a.get("line_score"))
+            if not name or line <= 0:
+                continue
+            is_combo = "(combo)" in stat_raw.lower()
+            base = re.sub(r"\s*\(combo\)\s*", "", stat_raw, flags=re.I).strip()
+            key = "es_" + re.sub(r"[^a-z0-9]+", "_", (lg + " " + base).lower()).strip("_")
+            STAT_LABEL.setdefault(key, base + (" (Combo)" if is_combo else ""))
+            if is_combo:
+                STAT_LABEL.setdefault(key + "_c", base + " (Combo)")
+            gid = (rel.get("game", {}).get("data") or {}).get("id")
+            ln = {"sport": lg, "name": name, "norm": _norm(name), "team": team, "pos": "",
+                  "stat": key + ("_c" if is_combo else ""), "group": "es", "half": None, "line": line,
+                  "start": _to_dt(a.get("start_time")), "opp": a.get("description") or "", "flags": {},
+                  "live": False, "gid": gid}
+            if is_combo:
+                combos.append((lg, key, ln))
+            else:
+                singles[(lg, key, _norm(name))] = ln
+        except Exception:
+            continue
+    out, matched = [], 0
+    for lg, key, ln in combos:
+        start = _upcoming([ln])
+        if not start:
+            continue
+        parts = [x.strip() for x in re.split(r"\s*\+\s*", ln["name"]) if x.strip()]
+        legs = [singles.get((lg, key, _norm(x))) for x in parts]
+        if len(parts) < 2 or not all(legs):
+            continue
+        matched += 1
+        total = sum(x["line"] for x in legs)
+        gap = total - ln["line"]
+        need = max(ES_GAP_MIN, ES_GAP_PCT * ln["line"])
+        if abs(gap) < need:
+            continue
+        direction = "OVER" if gap > 0 else "UNDER"
+        parts_txt = " + ".join(f"{x['name']} {x['line']:g}" for x in legs)
+        notes = [f"PrizePicks' own lines: {parts_txt} = {total:g}, but the combo is {ln['line']:g}",
+                 "Each line is a middle guess, so the sum is a fair check but not exact",
+                 "If a map isn't played or a player is benched, check PrizePicks' DNP rules before you lock"]
+        a = {"direction": direction, "proj": total, "gap": gap, "cur": 0, "line": ln["line"], "margin": 0,
+             "team": {}, "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": 0.0,
+             "strength": abs(gap) / need, "shape": "PRE-pregame", "game": "ES" + str(ln.get("gid") or ln["name"]),
+             "pre": True, "sport": lg, "score_txt": f"{ln['team'] or lg} {ln['opp'] and 'vs ' + ln['opp']} • starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} ({lg})", "f": 0.0, "period": 0, "clock_txt": ""}
+        out.append(((lg, ln["norm"], ln["stat"], None), ln, ev, a))
+    if time.time() - _state.get("es_log_t", 0) > 3600:
+        _state["es_log_t"] = time.time()
+        print(f"ESPORTS PREGAME CHECK: {len(singles)} single lines, {len(combos)} combos, {matched} combos matched to "
+              f"their players, {len(out)} picks")
+    return out
+
+
+# ====================== NBA PREGAME RECENT FORM (v2.7) ======================
+# Like NHL: the player's last 10 games (this season first, topped up with last season's games for the SAME team),
+# plus the opponent's points allowed as the matchup. Posts only when 2+ reasons agree and the matchup isn't against it.
+NBA_FORM_STATS = ("pts", "reb", "ast", "fg3", "pra", "pr", "pa", "ra", "fant")
+NBA_FORM_GAP = {"pts": 3.0, "reb": 1.5, "ast": 1.5, "fg3": 0.8, "pra": 4.0, "pr": 3.0, "pa": 3.0, "ra": 2.0, "fant": 5.0}
+NBA_SCORING = ("pts", "fg3", "pra", "pr", "pa", "fant")       # stats the opponent's points allowed says something about
+NBA_MIN_MINUTES = float(os.getenv("HB_NBA_FORM_MIN_MINUTES", "20"))
+NBA_TEAM_ALIAS = {"NYK": "NY", "GSW": "GS", "SAS": "SA", "NOP": "NO", "NOR": "NO", "UTA": "UTAH", "UTH": "UTAH",
+                  "WAS": "WSH", "PHO": "PHX", "BRK": "BKN", "BRO": "BKN", "CHO": "CHA", "NJN": "BKN"}
+
+
+def _nba_season_year():
+    n = datetime.now(_ET) if _ET is not timezone.utc else _now()
+    return n.year + 1 if n.month >= 9 else n.year                 # the 2026-27 season is "2027" at ESPN
+
+
+def nba_teams():
+    hit = _state.get("nba_teams")
+    if hit and time.time() - hit[0] < 24 * 3600:
+        return hit[1]
+    out = {}
+    try:
+        for t in _get_json(ESPN["NBA"] + "/teams")["sports"][0]["leagues"][0]["teams"]:
+            tm = t.get("team") or {}
+            names = {tm.get("abbreviation", ""), tm.get("shortDisplayName", ""), tm.get("name", ""),
+                     tm.get("location", ""), tm.get("displayName", "")}
+            out[str(tm.get("id"))] = {"abbr": tm.get("abbreviation", ""), "name": tm.get("displayName", ""),
+                                      "keys": {re.sub(r"[^A-Z]", "", n.upper()) for n in names if n}}
+    except Exception as e:
+        print("NBA teams error:", e)
+    if out:
+        _state["nba_teams"] = (time.time(), out)
+    return out
+
+
+def _nba_team(teams, txt):
+    k = re.sub(r"[^A-Z]", "", str(txt or "").upper())
+    if not k:
+        return None
+    k = NBA_TEAM_ALIAS.get(k, k)
+    for tid, t in teams.items():
+        if k == t["abbr"] or k in t["keys"]:
+            return tid
+    for tid, t in teams.items():
+        if any(len(x) > 3 and x in k for x in t["keys"]):
+            return tid
+    return None
+
+
+def _score_val(x):
+    if isinstance(x, dict):
+        return _num(x.get("value", x.get("displayValue")))
+    return _num(x)
+
+
+def _nba_team_games(tid):
+    """A team's last 10 finished regular-season games, newest first: [(event id, points allowed)].
+    This season first, topped up with last season's games. Refreshed every 3 hours."""
+    sc = _state.setdefault("nba_sched", {})
+    hit = sc.get(tid)
+    if hit and time.time() - hit[0] < 3 * 3600:
+        return hit[1]
+    games, y, now = [], _nba_season_year(), _now()
+    for yr in (y, y - 1):
+        try:
+            d = _get_json(f"{ESPN['NBA']}/teams/{tid}/schedule?season={yr}&seasontype=2")
+        except Exception as e:
+            print(f"NBA schedule error ({tid} {yr}):", e)
+            continue
+        for ev in d.get("events", []) or []:
+            dt = _to_dt(ev.get("date"))
+            comp = (ev.get("competitions") or [{}])[0]
+            done = (((comp.get("status") or {}).get("type") or {}).get("completed"))
+            if not dt or (now - dt).total_seconds() < 4 * 3600 or done is False:
+                continue
+            allowed = None
+            for c in comp.get("competitors", []) or []:
+                if str((c.get("team") or {}).get("id")) != str(tid):
+                    allowed = _score_val(c.get("score"))
+            games.append((dt, str(ev.get("id")), allowed))
+        if len(games) >= FORM_GAMES:
+            break
+    games.sort(reverse=True)
+    out = [(eid, al) for _, eid, al in games[:FORM_GAMES]]
+    sc[tid] = (time.time(), out)
+    return out
+
+
+def _nba_game_box(eid):
+    cache = _state.setdefault("nba_box", {})
+    if eid in cache:
+        return cache[eid]
+    if _state.get("form_budget", 0) <= 0:
+        return None
+    _state["form_budget"] -= 1
+    try:
+        d = _get_json(f"{ESPN['NBA']}/summary?event={eid}")
+    except Exception:
+        return None
+    players = {}
+    for team in (d.get("boxscore") or {}).get("players", []) or []:
+        for cat in team.get("statistics", []) or []:
+            labels = cat.get("labels") or []
+            for ath in cat.get("athletes", []) or []:
+                nm = _norm((ath.get("athlete") or {}).get("displayName", ""))
+                vals = ath.get("stats") or []
+                if not nm or not vals or len(vals) != len(labels):
+                    continue
+                row = dict(zip(labels, vals))
+                mins = _num(row.get("MIN"))
+                if mins <= 0:
+                    continue
+                made, _ = _split_pair(row.get("3PT"))
+                p = {"minutes": mins, "pts": _num(row.get("PTS")), "reb": _num(row.get("REB")),
+                     "ast": _num(row.get("AST")), "fg3": float(made), "stl": _num(row.get("STL")),
+                     "blk": _num(row.get("BLK")), "tov": _num(row.get("TO"))}
+                players[nm] = derive(p)
+    cache[eid] = players
+    return players
+
+
+def nba_form_pregame(board):
+    lines = [(k, ln) for k, ln in board.items() if ln["sport"] == "NBA" and ln.get("half") is None
+             and ln["stat"] in NBA_FORM_STATS and not ln["live"] and ln["line"] > 0 and _upcoming([ln])]
+    if not lines:
+        return []
+    teams = nba_teams()
+    if not teams:
+        return []
+    allowed = {}
+    out, waiting, checked = [], 0, 0
+    for key, ln in lines:
+        mine, opp = _nba_team(teams, ln["team"]), _nba_team(teams, ln["opp"])
+        if not mine:
+            continue
+        games = _nba_team_games(mine)
+        vals, mins, ready = [], [], True
+        for eid, _al in games:
+            box = _nba_game_box(eid)
+            if box is None:
+                ready = False
+                break
+            r = box.get(ln["norm"])
+            if r:
+                vals.append(r[ln["stat"]])
+                mins.append(r["minutes"])
+        if not ready:
+            waiting += 1
+            continue
+        checked += 1
+        if len(vals) < FORM_MIN_PLAYED or sum(mins) / len(mins) < NBA_MIN_MINUTES:
+            continue
+        stat, L = ln["stat"], ln["line"]
+        n = len(vals)
+        avg = sum(vals) / n
+        direction = "OVER" if avg > L else "UNDER"
+        good = sum(1 for v in vals if (v > L if direction == "OVER" else v < L))
+        rate = good / n
+        need = max(NBA_FORM_GAP[stat], 0.10 * L)
+        if rate < FORM_RATE or abs(avg - L) < need:
+            continue
+        reasons = [f"✅ {good} of his last {n} games went {direction} {L:g}",
+                   f"✅ Averaging {avg:.1f} vs a line of {L:g} ({sum(mins) / len(mins):.0f} minutes a game)"]
+        r3 = False
+        if opp and stat in NBA_SCORING:
+            if not allowed:
+                for tid in teams:
+                    g = [al for _, al in _nba_team_games(tid) if al]
+                    if len(g) >= 5:
+                        allowed[tid] = sum(g) / len(g)
+            if opp in allowed and allowed:
+                lg = sum(allowed.values()) / len(allowed)
+                ratio = allowed[opp] / lg
+                what = f"{teams[opp]['abbr']} allow {allowed[opp]:.1f} points a game (league {lg:.1f})"
+                if (direction == "OVER" and ratio >= 1.04) or (direction == "UNDER" and ratio <= 0.96):
+                    r3 = True
+                    reasons.append(f"✅ Matchup helps: {what}")
+                elif (direction == "OVER" and ratio <= 0.96) or (direction == "UNDER" and ratio >= 1.04):
+                    continue                            # matchup is against it: skip
+                else:
+                    reasons.append(f"➖ Matchup is neutral: {what}")
+        last5 = vals[:5]
+        l5 = sum(last5) / len(last5)
+        r4 = len(last5) >= 4 and ((l5 - L) if direction == "OVER" else (L - l5)) >= 0.5 * need
+        if r4:
+            reasons.append(f"✅ Last {len(last5)}: averaging {l5:.1f}")
+        if not (r3 or r4):
+            continue
+        notes = reasons + [f"Last {n}: " + ", ".join(f"{v:g}" for v in vals),
+                           "Check injuries and minutes news before you lock (the bot can't see them)"]
+        if float(L).is_integer():
+            notes.append(f"Whole-number line: exactly {L:g} is a push")
+        start = _upcoming([ln])
+        n_reasons = 2 + int(r3) + int(r4)
+        a = {"direction": direction, "proj": avg, "gap": avg - L, "cur": 0, "line": L, "margin": 0, "team": {},
+             "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": rate,
+             "strength": rate / FORM_RATE * (1 + 0.15 * (n_reasons - 3)), "shape": "PRE-pregame",
+             "game": "NB" + str(ln.get("gid") or ln["team"]), "pre": True, "sport": "NBA", "form": True,
+             "score_txt": f"{teams[mine]['abbr']} vs {teams[opp]['abbr'] if opp else ln['opp']} • starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} ({teams[mine]['name']}) — {n_reasons} reasons agree", "f": 0.0,
+              "period": 0, "clock_txt": ""}
+        out.append((key, ln, ev, a))
+    if time.time() - _state.get("nba_form_log_t", 0) > 3600 or (waiting == 0 and not _state.get("nba_form_ready")):
+        _state["nba_form_log_t"] = time.time()
+        _state["nba_form_ready"] = waiting == 0
+        print(f"NBA FORM CHECK: {len(lines)} pregame lines, {checked} checked, {waiting} still loading box scores, "
+              f"{len(out)} picks ({len(_state.get('nba_box', {}))} box scores cached)")
+    return out
+
+
 def _pre_room():
     now = time.time()
     _state["pre_times"] = [t for t in _state["pre_times"] if now - t < 3600]
@@ -2007,7 +2310,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v2.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v2.7 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     lean = ("⚠️ CAUTION — LEAN " if a.get("caution") else "LEAN ") + a["direction"]
     color = 15105570 if a.get("caution") else (3066993 if a["direction"] == "OVER" else 3447003)
@@ -2035,9 +2338,26 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v2.4 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v2.7 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
+
+
+PRE_PAIR_WAIT = float(os.getenv("HB_PRE_PAIR_WAIT_MINUTES", "45")) * 60
+# v2.6: pregame picks post ONLY as pairs (two juicy picks from different games). A pick with no partner is not posted.
+PRE_PAIRS_ONLY = os.getenv("HB_PRE_PAIRS_ONLY", "true").lower() == "true"
+
+
+def _pair_wait(c):
+    """v2.5: live picks wait 75 seconds for a partner. Pregame picks have hours, so they wait up to 45 minutes,
+    but always post alone by 1 hour before their game starts."""
+    if not c[3].get("pre"):
+        return PAIR_WAIT
+    st = c[1].get("start")
+    if not st:
+        return PAIR_WAIT
+    left = (st - _now()).total_seconds() - 3600
+    return max(PAIR_WAIT, min(PRE_PAIR_WAIT, left))
 
 
 def process_candidates(fresh):
@@ -2094,7 +2414,9 @@ def process_candidates(fresh):
             used |= {c1[0], best[1][0]}
             posted += 1
     for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
-        if c[0] not in used and now - _state["pending"].get(c[0], now) >= PAIR_WAIT:
+        if PRE_PAIRS_ONLY and c[3].get("pre"):
+            continue                                   # v2.6: pregame picks only ever post as a PAIR
+        if c[0] not in used and now - _state["pending"].get(c[0], now) >= _pair_wait(c):
             if not _room():
                 break
             send_single(c)
@@ -2367,6 +2689,10 @@ def cycle(first=False):
             _state["form_budget"] = FORM_FETCH_PER_CYCLE
             pre_fresh = all_combo_pregame(board) + (nhl_saves_pregame(board) + nhl_form_pregame(board)
                                                     if "NHL" in SPORTS else []) + (tennis_pregame(_state["tboard"]) if TENNIS_ON else [])
+            if ES_ON:
+                pre_fresh += esports_pregame(raw)
+            if "NBA" in SPORTS:
+                pre_fresh += nba_form_pregame(board)
         except Exception as e:                      # the pregame check can never stop live alerts
             print("pregame error:", e)
     fresh += pre_fresh
@@ -2381,7 +2707,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v2.4 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v2.7 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
