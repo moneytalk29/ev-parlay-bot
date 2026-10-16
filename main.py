@@ -1,4 +1,4 @@
-"""Heartbeat v2.1: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v2.3: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -91,7 +91,13 @@ PAIR_SAME_SHAPE_BONUS = float(os.getenv("HB_PAIR_SAME_SHAPE_BONUS", "0.3"))   # 
 LOPSIDED = {"NFL": float(os.getenv("HB_NFL_LOPSIDED", "10")), "NBA": float(os.getenv("HB_NBA_LOPSIDED", "15")),
             "NHL": float(os.getenv("HB_NHL_LOPSIDED", "2"))}  # margin that makes a game "lopsided"
 # NFL game-script strength: change in volume per 7 points of margin (a "score"), and the cap
-PASS_TRAIL, PASS_TRAIL_CAP = float(os.getenv("HB_PASS_TRAIL", "0.07")), float(os.getenv("HB_PASS_TRAIL_CAP", "0.30"))
+PASS_TRAIL, PASS_TRAIL_CAP = float(os.getenv("HB_PASS_TRAIL", "0.16")), float(os.getenv("HB_PASS_TRAIL_CAP", "0.40"))
+# v2.3: a trailing team passes on ~70-80% of plays (normal ~58%), so its passing volume is boosted by about
+# +25% when down 10 in the 2nd half and up to +40% when down 14+ late.
+# v2.2: a team down 10+ from late in the 2nd quarter on throws on almost every play. Never post a passing/receiving
+# UNDER for that team (not even as CAUTION).
+TRAIL_BLOCK_MARGIN = float(os.getenv("HB_TRAIL_BLOCK_MARGIN", "10"))
+TRAIL_BLOCK_FROM = float(os.getenv("HB_TRAIL_BLOCK_FROM", "0.45"))
 PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.05")), float(os.getenv("HB_PASS_LEAD_CAP", "0.20"))
 RUSH_LEAD, RUSH_LEAD_CAP = float(os.getenv("HB_RUSH_LEAD", "0.08")), float(os.getenv("HB_RUSH_LEAD_CAP", "0.30"))
 RUSH_TRAIL, RUSH_TRAIL_CAP = float(os.getenv("HB_RUSH_TRAIL", "0.09")), float(os.getenv("HB_RUSH_TRAIL_CAP", "0.35"))
@@ -205,6 +211,10 @@ YARD_DAMP = {"pass_yds": 0.8, "rush_yds": 0.8, "rec_yds": 0.8, "pass_cmp": 0.9, 
 # throw 42 times and still miss his yards). Yard props need a bigger gap to alert, and volume props rank first when pairing.
 YARD_STATS = ("pass_yds", "rec_yds")      # rush yards are NOT here: a leading team runs on purpose, so they follow the script closely
 YARD_EDGE_MULT = float(os.getenv("HB_YARD_EDGE_MULT", "1.3"))
+# v2.3: a yards UNDER needs a cushion bigger than one big play (OVERs are not affected)
+BIG_PLAY_CUSHION = {"pass_yds": float(os.getenv("HB_UNDER_CUSHION_PASS", "45")),
+                    "rec_yds": float(os.getenv("HB_UNDER_CUSHION_REC", "30")),
+                    "rush_yds": float(os.getenv("HB_UNDER_CUSHION_RUSH", "25"))}
 PRIORITY = {"pass_att": 1.2, "rush_att": 1.15, "rec_cnt": 1.05, "pass_cmp": 1.0,
             "rush_yds": 1.1, "rec_yds": 0.9, "pass_yds": 0.8, "fant": 0.95, "sog": 1.1, "saves": 1.05}
 BAD_WORDS = ("1h", "2h", "1q", "2q", "3q", "4q", "1st", "2nd", "half", "quarter", "combo", "+", "(", "longest",
@@ -720,6 +730,10 @@ def nfl_script(group, stat, margin, f):
     """Volume multiplier for the rest of the game, from the team's score margin (+ = leading)."""
     scale = 0.4 + 0.6 * f                         # an early deficit says less than a late one
     units = abs(margin) / 7.0
+    if group in ("pass", "rec") and margin < 0:   # v2.2: trailing passing grows faster as the game goes on
+        m = 1 + min(PASS_TRAIL_CAP, PASS_TRAIL * units * min(1.0, 0.6 + 0.6 * f))
+        damp = 0.9 if stat in ("pass_yds", "rec_yds") else 1.0   # yards follow the extra throws almost fully
+        return 1 + (m - 1) * damp
     if group in ("pass", "rec"):                  # receivers ride the same team passing volume as the QB
         m = (1 + min(PASS_TRAIL_CAP, PASS_TRAIL * units * scale)) if margin < 0 else \
             (1 - min(PASS_LEAD_CAP, PASS_LEAD * units * scale)) if margin > 0 else 1.0
@@ -940,6 +954,8 @@ def evaluate(line, event, box, prior):
     need = max(EDGE_PCT * L, min_abs)
     if line["stat"] in YARD_STATS:
         need *= YARD_EDGE_MULT                       # yards are riskier than volume, so ask for a bigger gap
+    if gap < 0 and line["stat"] in BIG_PLAY_CUSHION:
+        need = max(need, BIG_PLAY_CUSHION[line["stat"]])   # v2.3: one long play can erase a yards UNDER
     if abs(gap) < need:
         return None
     if half == 1:
@@ -948,6 +964,9 @@ def evaluate(line, event, box, prior):
             return None
     elif SCRIPT_ONLY and abs(factor - 1) < SCRIPT_MIN:
         return None
+    if (line["sport"] == "NFL" and line.get("group") in ("pass", "rec") and gap < 0
+            and margin <= -TRAIL_BLOCK_MARGIN and f >= TRAIL_BLOCK_FROM):
+        return None                                  # v2.2: down 10+ late = they throw every play: no passing UNDER
     caution = half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1)
     if caution and not CAUTION_ON:
         return None
@@ -1975,7 +1994,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v2.1 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v2.3 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     lean = ("⚠️ CAUTION — LEAN " if a.get("caution") else "LEAN ") + a["direction"]
     color = 15105570 if a.get("caution") else (3066993 if a["direction"] == "OVER" else 3447003)
@@ -2003,7 +2022,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v2.1 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v2.3 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -2349,7 +2368,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v2.1 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v2.3 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
