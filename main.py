@@ -1,4 +1,4 @@
-"""Heartbeat v2.3: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v2.4: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -1870,25 +1870,38 @@ def nhl_form_pregame(board):
         reasons.append(f"✅ {hits_n} of his last {n} {'starts' if is_goalie else 'games'} went {direction} {L:g}")
         reasons.append(f"✅ Averaging {avg:.1f} vs a line of {L:g}")
         r3 = False
+        against = False
+        mline = None                                    # v2.4: the matchup is always shown (✅ / ➖ / ❌)
         if opp:
             O = ts[opp]
+            good_hi = direction == "OVER"
             if stat in ("sog",) or (stat == "nhl_fant" and not is_goalie):
                 ratio = O["sa"] / lg_sa
-                if (direction == "OVER" and ratio >= 1.06) or (direction == "UNDER" and ratio <= 0.94):
-                    r3 = True
-                    reasons.append(f"✅ {O['abbr']} allow {O['sa']:.1f} shots a game (league {lg_sa:.1f})")
+                what = f"{O['abbr']} allow {O['sa']:.1f} shots a game (league {lg_sa:.1f})"
             elif stat == "nhl_blk":
                 ratio = O["sf"] / lg_sf
-                if (direction == "OVER" and ratio >= 1.06) or (direction == "UNDER" and ratio <= 0.94):
-                    r3 = True
-                    reasons.append(f"✅ {O['abbr']} take {O['sf']:.1f} shots a game (league {lg_sf:.1f}): "
-                                   f"{'more' if direction == 'OVER' else 'fewer'} shots to block")
-            elif is_goalie:
+                what = f"{O['abbr']} take {O['sf']:.1f} shots a game (league {lg_sf:.1f}), the shots there are to block"
+            elif is_goalie and stat == "saves":
                 sm = _state.get("saves_model", {}).get(ln["norm"])
-                if sm and ((sm[0] > L + 2) if direction == "OVER" else (sm[0] < L - 2)) and stat == "saves":
+                ratio = (sm[0] / L) if sm and L else None
+                what = (f"about {sm[1]:.0f} shots expected on him ({sm[3]['abbr']} take {sm[3]['sf']:.1f}, "
+                        f"{sm[2]['abbr']} allow {sm[2]['sa']:.1f})") if sm else ""
+            else:
+                ratio, what = None, ""                  # hits, faceoffs, time on ice: no matchup number
+            if ratio is not None:
+                hi, lo = (1.06, 0.94) if stat != "saves" else (1.07, 0.93)
+                if (good_hi and ratio >= hi) or (not good_hi and ratio <= lo):
                     r3 = True
-                    reasons.append(f"✅ Matchup: about {sm[1]:.0f} shots expected on him ({sm[3]['abbr']} take "
-                                   f"{sm[3]['sf']:.1f}, {sm[2]['abbr']} allow {sm[2]['sa']:.1f})")
+                    mline = f"✅ Matchup helps: {what}"
+                elif (good_hi and ratio <= lo) or (not good_hi and ratio >= hi):
+                    against = True
+                    mline = f"❌ Matchup is against it: {what}"
+                else:
+                    mline = f"➖ Matchup is neutral: {what}"
+        if against:
+            continue                                    # v2.4: never post a pick the matchup works against
+        if mline:
+            reasons.append(mline)
         last5 = vals[:5]
         l5 = sum(last5) / len(last5)
         r4 = len(last5) >= 4 and ((l5 - L) if direction == "OVER" else (L - l5)) >= 0.5 * need
@@ -1994,7 +2007,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v2.3 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v2.4 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     lean = ("⚠️ CAUTION — LEAN " if a.get("caution") else "LEAN ") + a["direction"]
     color = 15105570 if a.get("caution") else (3066993 if a["direction"] == "OVER" else 3447003)
@@ -2022,7 +2035,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v2.3 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v2.4 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -2368,7 +2381,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v2.3 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v2.4 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
