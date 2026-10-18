@@ -1,8 +1,10 @@
 """Heartbeat v3.0: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
-  1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
-  2. Remembers each line from BEFORE kickoff (the "pregame line"), which is the market's expectation for the player.
+  1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA, NHL, tennis and esports player lines.
+  2. v3.0: LIVE picks start from PrizePicks' CURRENT live line (it already includes the score), not the line from
+     before kickoff. The bot only posts when the player's pace and the score both push past that line.
+     (The pregame channel still reads pregame lines, because that's what those picks are about.)
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
        NFL: a team that trails throws more and runs less; a team that leads runs more and throws less.
@@ -23,15 +25,14 @@ What it does
                the Aces line). NBA: PRA, Pts+Rebs, Pts+Asts, Rebs+Asts vs the single Points/Rebounds/Assists lines.
      Each line posts once (again only if the line changes), at most HB_PRE_MAX_LEGS_PER_HOUR legs an hour.
   6. Posts to your Discord webhook when the projection is far enough from PrizePicks' current line.
-     Picks go out as PAIRS (two legs from DIFFERENT games, never the same game, same game-shape preferred) so you can
-     lock both fast. A lone pick waits HB_PAIR_WAIT_SECONDS for a partner, then posts alone, so nothing is lost.
+     v3.0: picks go out ONLY as PAIRS (two legs from DIFFERENT games, never the same game), live and pregame.
+     A pick with no partner is not posted. CAUTION picks (against the score) are not posted.
 
 Honest limits (read these)
   - The script adjustments below are STARTING GUESSES, not proven numbers. Every alert is logged so they can be
     checked and tuned against real results. Treat the first weeks as testing.
   - ESPN's public data is unofficial and can change or lag a few seconds.
-  - It needs the pregame line saved BEFORE kickoff. If the service restarts during a game, lines for that
-    game have no saved prior and are skipped (set HB_ALLOW_NO_PRIOR=true to override, at lower trust).
+  - v3.0: a restart during a game no longer loses picks (no saved pregame line is needed for live picks).
   - It does not know about injuries, a backup QB coming in, or weather.
   - Tennis: it does not know who is serving, and it assumes best-of-3 sets (men's Grand Slams are best-of-5:
     set HB_TENNIS_BEST_OF=5 for those weeks). If a player retires, PrizePicks keeps the stats so far (risk for overs).
@@ -104,6 +105,11 @@ TRAIL_BLOCK_FROM = float(os.getenv("HB_TRAIL_BLOCK_FROM", "0.25"))     # v2.9: f
 NFL_NO_AGAINST_MARGIN = float(os.getenv("HB_NFL_NO_AGAINST_MARGIN", "10"))
 NFL_NO_AGAINST_VOLUME_MARGIN = float(os.getenv("HB_NFL_NO_AGAINST_VOLUME_MARGIN", "7"))
 NFL_VOLUME = ("pass_att", "pass_cmp", "rec_cnt", "rush_att")
+# v3.0: when the live line has moved this much (or 5%) since pregame, the bot never picks the other way.
+# v3.0: live picks no longer use the line from before kickoff. The baseline is PrizePicks' current live line,
+# which already includes the score. Set HB_USE_PREGAME_LINE=true to go back to the old way.
+USE_PREGAME_LINE = os.getenv("HB_USE_PREGAME_LINE", "false").lower() == "true"
+NFL_MOVE_MIN = float(os.getenv("HB_NFL_MOVE_MIN", "1.5"))
 PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.08")), float(os.getenv("HB_PASS_LEAD_CAP", "0.25"))
 RUSH_LEAD, RUSH_LEAD_CAP = float(os.getenv("HB_RUSH_LEAD", "0.08")), float(os.getenv("HB_RUSH_LEAD_CAP", "0.30"))
 RUSH_TRAIL, RUSH_TRAIL_CAP = float(os.getenv("HB_RUSH_TRAIL", "0.09")), float(os.getenv("HB_RUSH_TRAIL_CAP", "0.35"))
@@ -756,7 +762,7 @@ def project_nfl(line, cur, prior, f, margin):
     m = nfl_script(line["group"], line["stat"], margin, f)
     c = cur.get(line["stat"], 0.0)
     proj = c + total * r * m
-    notes = [f"Pace baseline {total:.1f} for the full game (pregame line {prior:g})",
+    notes = [f"Pace baseline {total:.1f} for the full game (PrizePicks line {prior:g})",
              f"Script factor ×{m:.2f} on the rest of the game (team {'leads' if margin > 0 else 'trails' if margin < 0 else 'tied'}"
              + (f" by {abs(margin)}" if margin else "") + ")"]
     if margin >= 21 and f >= 0.7:
@@ -793,7 +799,7 @@ def project_nhl(line, cur, prior, f, margin):
     m = nhl_script(line["group"], margin, f)
     proj = c + total * (1 - f) * m
     lead_txt = "leads" if margin > 0 else "trails" if margin < 0 else "tied"
-    notes = [f"Pace baseline {total:.1f} for the full game (pregame line {prior:g})",
+    notes = [f"Pace baseline {total:.1f} for the full game (PrizePicks line {prior:g})",
              f"Score effect ×{m:.2f} on the rest of the game (team {lead_txt}" + (f" by {abs(margin)}" if margin else "") + ")"]
     if line["group"] == "shots" and margin < 0 and f >= 0.85:
         notes.append("Trailing late: the goalie may be pulled for an extra attacker (more shots)")
@@ -981,6 +987,10 @@ def evaluate(line, event, box, prior):
     if (line["sport"] == "NFL" and line.get("group") in ("pass", "rec") and gap > 0
             and margin >= TRAIL_BLOCK_MARGIN and f >= TRAIL_BLOCK_FROM):
         return None                                  # v2.9 mirror: up 10+ = they run the clock: no passing OVER
+    moved_now = L - prior
+    if (line["sport"] == "NFL" and line["live"] and abs(moved_now) >= max(NFL_MOVE_MIN, 0.05 * prior)
+            and (gap > 0) != (moved_now > 0)):
+        return None                                  # v3.0: PrizePicks moved the live line for the score: never fade that move
     caution = half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1)
     if caution and not CAUTION_ON:
         return None
@@ -2385,6 +2395,9 @@ def process_candidates(fresh):
         if k not in live_keys:
             del _state["pending"][k]
     ready = []
+    nowdt = _now()
+    fresh = [c for c in fresh if not (c[3].get("pre") and (c[1].get("live")
+             or (c[1].get("start") is not None and nowdt >= c[1]["start"])))]   # v3.0: pregame picks ONLY before kickoff
     for c in fresh:
         if c[3].get("pre"):
             if _state["pre_sent"].get(c[0]) == c[3]["line"] or not _pre_room():
@@ -2687,7 +2700,10 @@ def cycle(first=False):
             box = boxes.get((sport, ev["id"]))
             if not box or ln["norm"] not in box:
                 continue
-            prior, est = get_prior(key, ln)
+            if not USE_PREGAME_LINE:                 # v3.0: live picks start from PrizePicks' CURRENT line, not the pregame one
+                prior, est = ln["line"], False
+            else:
+                prior, est = get_prior(key, ln)
             ln["prior_est"] = est
             if prior is None:
                 if not ALLOW_NO_PRIOR:
