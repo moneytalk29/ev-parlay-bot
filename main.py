@@ -1,4 +1,4 @@
-"""Heartbeat v2.7: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
+"""Heartbeat v3.0: live NFL + NBA + NHL + TENNIS scanner for PrizePicks lines, plus a pregame line check. ALERT ONLY, it never places bets.
 
 What it does
   1. Reads the PrizePicks board (PrizePicks' public feed) for NFL, NBA and tennis player lines.
@@ -97,8 +97,14 @@ PASS_TRAIL, PASS_TRAIL_CAP = float(os.getenv("HB_PASS_TRAIL", "0.16")), float(os
 # v2.2: a team down 10+ from late in the 2nd quarter on throws on almost every play. Never post a passing/receiving
 # UNDER for that team (not even as CAUTION).
 TRAIL_BLOCK_MARGIN = float(os.getenv("HB_TRAIL_BLOCK_MARGIN", "10"))
-TRAIL_BLOCK_FROM = float(os.getenv("HB_TRAIL_BLOCK_FROM", "0.45"))
-PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.05")), float(os.getenv("HB_PASS_LEAD_CAP", "0.20"))
+TRAIL_BLOCK_FROM = float(os.getenv("HB_TRAIL_BLOCK_FROM", "0.25"))     # v2.9: from the start of the 2nd quarter
+# v2.9: NFL picks that go AGAINST the game script are not posted (not even as CAUTION) when:
+#   - the score gap is 10+ from the 2nd quarter on (any stat), or
+#   - the gap is 7+ and it's a VOLUME stat (attempts, completions, catches, carries), which follow the script closely.
+NFL_NO_AGAINST_MARGIN = float(os.getenv("HB_NFL_NO_AGAINST_MARGIN", "10"))
+NFL_NO_AGAINST_VOLUME_MARGIN = float(os.getenv("HB_NFL_NO_AGAINST_VOLUME_MARGIN", "7"))
+NFL_VOLUME = ("pass_att", "pass_cmp", "rec_cnt", "rush_att")
+PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.08")), float(os.getenv("HB_PASS_LEAD_CAP", "0.25"))
 RUSH_LEAD, RUSH_LEAD_CAP = float(os.getenv("HB_RUSH_LEAD", "0.08")), float(os.getenv("HB_RUSH_LEAD_CAP", "0.30"))
 RUSH_TRAIL, RUSH_TRAIL_CAP = float(os.getenv("HB_RUSH_TRAIL", "0.09")), float(os.getenv("HB_RUSH_TRAIL_CAP", "0.35"))
 # NHL (v1.9) score effects: change in the rest-of-game rate per goal of margin, and the cap
@@ -967,6 +973,14 @@ def evaluate(line, event, box, prior):
     if (line["sport"] == "NFL" and line.get("group") in ("pass", "rec") and gap < 0
             and margin <= -TRAIL_BLOCK_MARGIN and f >= TRAIL_BLOCK_FROM):
         return None                                  # v2.2: down 10+ late = they throw every play: no passing UNDER
+    against = abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1)
+    if line["sport"] == "NFL" and against and (
+            (abs(margin) >= NFL_NO_AGAINST_MARGIN and f >= TRAIL_BLOCK_FROM)
+            or (line["stat"] in NFL_VOLUME and abs(margin) >= NFL_NO_AGAINST_VOLUME_MARGIN)):
+        return None                                  # v2.9: never against the score in a 7+/10+ point game
+    if (line["sport"] == "NFL" and line.get("group") in ("pass", "rec") and gap > 0
+            and margin >= TRAIL_BLOCK_MARGIN and f >= TRAIL_BLOCK_FROM):
+        return None                                  # v2.9 mirror: up 10+ = they run the clock: no passing OVER
     caution = half != 1 and abs(factor - 1) >= SCRIPT_MIN and (gap > 0) != (factor > 1)
     if caution and not CAUTION_ON:
         return None
@@ -2310,7 +2324,7 @@ def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
     _state["sent"].append(time.time())
-    footer = "Model v2.7 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
+    footer = "Model v3.0 • alert only • projection, not a guarantee" + (f" • {label}" if label else "")
     tag = " PREGAME" if a.get("pre") else (" LIVE" if line["live"] else "")
     lean = ("⚠️ CAUTION — LEAN " if a.get("caution") else "LEAN ") + a["direction"]
     color = 15105570 if a.get("caution") else (3066993 if a["direction"] == "OVER" else 3447003)
@@ -2338,7 +2352,7 @@ def send_pair(c1, c2):
              "description": "Two different games" + (f", both {c1[3]['shape'].split('-')[1]} games" if same_shape and not pre else "") +
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
-             "footer": {"text": "Model v2.7 • alert only • projections, not guarantees"}}
+             "footer": {"text": "Model v3.0 • alert only • projections, not guarantees"}}
     _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
 
@@ -2346,6 +2360,9 @@ def send_pair(c1, c2):
 PRE_PAIR_WAIT = float(os.getenv("HB_PRE_PAIR_WAIT_MINUTES", "45")) * 60
 # v2.6: pregame picks post ONLY as pairs (two juicy picks from different games). A pick with no partner is not posted.
 PRE_PAIRS_ONLY = os.getenv("HB_PRE_PAIRS_ONLY", "true").lower() == "true"
+# v3.0: live picks post ONLY as pairs too (two legs from different live games). No live singles, no CAUTION singles.
+# A live pick waits for a partner; if it stops qualifying first, it is dropped. Set HB_LIVE_PAIRS_ONLY=false to go back.
+LIVE_PAIRS_ONLY = os.getenv("HB_LIVE_PAIRS_ONLY", "true").lower() == "true"
 
 
 def _pair_wait(c):
@@ -2377,6 +2394,8 @@ def process_candidates(fresh):
         _state["pending"].setdefault(c[0], now)
         ready.append(c)
     posted = 0
+    if LIVE_PAIRS_ONLY and PAIR_MODE:
+        ready = [c for c in ready if not c[3].get("caution")]   # v3.0: CAUTION picks only posted as singles, so they are skipped
     for c in [c for c in ready if c[3].get("caution")]:      # CAUTION picks: alone, right away, never in a pair
         if not _room():
             break
@@ -2416,6 +2435,8 @@ def process_candidates(fresh):
     for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
         if PRE_PAIRS_ONLY and c[3].get("pre"):
             continue                                   # v2.6: pregame picks only ever post as a PAIR
+        if LIVE_PAIRS_ONLY and not c[3].get("pre"):
+            continue                                   # v3.0: live picks only ever post as a PAIR
         if c[0] not in used and now - _state["pending"].get(c[0], now) >= _pair_wait(c):
             if not _room():
                 break
@@ -2707,7 +2728,7 @@ def main():
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not set. Alerts will only print in the logs.")
     load_state()
-    print(f"Heartbeat v2.7 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
+    print(f"Heartbeat v3.0 starting. Sports: {SPORTS}{' + TENNIS' if TENNIS_ON else ''}. "
           f"PrizePicks every {PP_POLL:.0f}s, ESPN every {ESPN_POLL:.0f}s.")
     first = True
     while True:
