@@ -5,6 +5,7 @@ What it does
   2. v3.0: LIVE picks start from PrizePicks' CURRENT live line (it already includes the score), not the line from
      before kickoff. The bot only posts when the player's pace and the score both push past that line.
      (The pregame channel still reads pregame lines, because that's what those picks are about.)
+     LIVE NFL posts only QB Pass Yards and Pass Attempts (HB_NFL_LIVE_STATS). Rushing and receiving are a coin flip.
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
        NFL: a team that trails throws more and runs less; a team that leads runs more and throws less.
@@ -108,6 +109,8 @@ NFL_VOLUME = ("pass_att", "pass_cmp", "rec_cnt", "rush_att")
 # v3.0: when the live line has moved this much (or 5%) since pregame, the bot never picks the other way.
 # v3.0: live picks no longer use the line from before kickoff. The baseline is PrizePicks' current live line,
 # which already includes the score. Set HB_USE_PREGAME_LINE=true to go back to the old way.
+# v3.0: live NFL picks only on these stats (QB volume is the most predictable). Empty = all stats.
+NFL_LIVE_STATS = tuple(x.strip() for x in os.getenv("HB_NFL_LIVE_STATS", "pass_yds,pass_att").split(",") if x.strip())
 USE_PREGAME_LINE = os.getenv("HB_USE_PREGAME_LINE", "false").lower() == "true"
 NFL_MOVE_MIN = float(os.getenv("HB_NFL_MOVE_MIN", "1.5"))
 PASS_LEAD, PASS_LEAD_CAP = float(os.getenv("HB_PASS_LEAD", "0.08")), float(os.getenv("HB_PASS_LEAD_CAP", "0.25"))
@@ -930,6 +933,8 @@ def evaluate(line, event, box, prior):
     if not team or not opp:
         return None
     margin = team["score"] - opp["score"]
+    if line["sport"] == "NFL" and NFL_LIVE_STATS and line["stat"] not in NFL_LIVE_STATS:
+        return None                                  # v3.0: live NFL = QB passing yards and pass attempts only
     if line["sport"] == "NBA" and half:
         res = project_nba_half(line, event, cur, prior, abs(margin))
         if not res:
