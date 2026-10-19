@@ -486,7 +486,7 @@ def save_state(force=False):
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            used = [[list(k), t] for k, t in _state.get("used_props", {}).items() if now - t < PROP_ONCE_H * 3600]
+            used = [[list(k)] + list(v) for k, v in _state.get("used_props", {}).items() if now - v[0] < PROP_ONCE_H * 3600]
             json.dump({"v": 1, "prior": keep, "used": used}, f)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
@@ -514,9 +514,10 @@ def load_state():
             _state["prior"][key] = v
             pt[key] = t
             n += 1
-    for k, t in d.get("used", []):                  # v3.0: props already posted stay "used" after a restart
-        if now - t < PROP_ONCE_H * 3600:
-            _state.setdefault("used_props", {})[tuple(k)] = t
+    for row in d.get("used", []):                   # v3.0: props already posted stay "used" after a restart
+        k, v = row[0], (list(row[1:]) + [None, None])[:3]
+        if v[0] and now - v[0] < PROP_ONCE_H * 3600:
+            _state.setdefault("used_props", {})[tuple(k)] = tuple(v)
     print(f"SAVED LINES: restored {n} pregame lines from before the restart ({STATE_FILE})")
 
 
@@ -2506,7 +2507,7 @@ PROP_ONCE_H = float(os.getenv("HB_PROP_ONCE_HOURS", "20"))   # v3.0: a prop is u
 
 
 def _mark_sent(key, a):
-    _state.setdefault("used_props", {})[key] = time.time()
+    _state.setdefault("used_props", {})[key] = (time.time(), a["direction"], a.get("line"))
     _state["alerts"][key] = (time.time(), a["direction"], a.get("game"), a.get("line"))
     _state["pending"].pop(key, None)
     if a.get("pre"):
@@ -2610,9 +2611,13 @@ def process_candidates(fresh):
     fresh = [c for c in fresh if not (c[3].get("pre") and (c[1].get("live")
              or (c[1].get("start") is not None and nowdt >= c[1]["start"])))]   # v3.0: pregame picks ONLY before kickoff
     used = _state.setdefault("used_props", {})
-    for k in [k for k, t in used.items() if time.time() - t > PROP_ONCE_H * 3600]:
+    for k in [k for k, v in used.items() if time.time() - v[0] > PROP_ONCE_H * 3600]:
         del used[k]
-    fresh = [c for c in fresh if c[0] not in used]      # v3.0: already posted once (any line) -> never paired again
+
+    def _flipped(c):                                   # only a NEW line where the bot now likes the OTHER side counts
+        v = used[c[0]]
+        return v[1] is not None and c[3]["direction"] != v[1] and c[3].get("line") != v[2]
+    fresh = [c for c in fresh if c[0] not in used or _flipped(c)]   # v3.0: a prop posts ONCE (restarts included)
     for c in fresh:
         if c[3].get("pre"):
             if _state["pre_sent"].get(c[0]) == c[3]["line"] or not _pre_room():
