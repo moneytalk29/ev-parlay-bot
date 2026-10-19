@@ -6,6 +6,7 @@ What it does
      before kickoff. The bot only posts when the player's pace and the score both push past that line.
      (The pregame channel still reads pregame lines, because that's what those picks are about.)
      LIVE NFL posts only QB Pass Yards and Pass Attempts (HB_NFL_LIVE_STATS). Rushing and receiving are a coin flip.
+     CS2 PREGAME: single "MAPS 1-2 Kills" / "MAP 1 Kills" lines from the player's kills per round (bo3.gg, free).
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
        NFL: a team that trails throws more and runs less; a team that leads runs more and throws less.
@@ -759,7 +760,40 @@ def nfl_script(group, stat, margin, f):
     return 1 + (m - 1) * damp
 
 
+QB_TRAIL_ATT = float(os.getenv("HB_QB_TRAIL_ATT", "44"))      # full-game pass attempt pace for a team down 7 (about 22 a half)
+QB_LEAD_ATT = float(os.getenv("HB_QB_LEAD_ATT", "31"))        # full-game pass attempt pace for a team up 10
+QB_LEAGUE_YPA = float(os.getenv("HB_QB_LEAGUE_YPA", "6.6"))   # yards per attempt the QB's own number is pulled toward
+
+
+def project_qb_script(stat, cur, f, margin):
+    """v3.0: QB passing when the score decides the game plan. Instead of trusting the line, count the throws:
+    a team down 7+ throws about 38-45 times a game, a team up 10+ about 25-31. Remaining throws x his yards per throw."""
+    r = 1 - f
+    if margin <= -7:
+        per_game = QB_TRAIL_ATT + 0.5 * min(-margin - 7, 14)          # down 7: 44, down 14: 47.5, down 21: 51
+    elif margin >= 10:
+        per_game = QB_LEAD_ATT - 0.4 * min(margin - 10, 14)           # up 10: 31, up 17: 28, up 24: 25
+    else:
+        return None
+    att_left = per_game * r
+    att = cur.get("pass_att") or 0.0
+    yds = cur.get("pass_yds") or 0.0
+    ypa = (yds + 15 * QB_LEAGUE_YPA) / (att + 15)                       # his own yards per throw, pulled toward average
+    if stat == "pass_att":
+        proj = att + att_left
+    else:
+        proj = yds + att_left * ypa
+    side = "trails" if margin < 0 else "leads"
+    notes = [f"Team {side} by {abs(margin)}: about {per_game:.0f} throws a game at this score, {att_left:.0f} left",
+             f"{ypa:.1f} yards per throw (his {att:g} throws so far, pulled toward the league average)"]
+    return proj, (1.2 if margin < 0 else 0.8), notes
+
+
 def project_nfl(line, cur, prior, f, margin):
+    if line["stat"] in ("pass_att", "pass_yds") and f >= 0.25:
+        q = project_qb_script(line["stat"], cur, f, margin)
+        if q:
+            return q
     r = 1 - f
     total = _blend_total(prior, cur.get(line["stat"]), f)
     m = nfl_script(line["group"], line["stat"], margin, f)
@@ -2051,10 +2085,146 @@ def esports_pregame(raw):
              "pre": True, "sport": lg, "score_txt": f"{ln['team'] or lg} {ln['opp'] and 'vs ' + ln['opp']} • starts {_start_txt(start)}"}
         ev = {"id": a["game"], "name": f"{ln['name']} ({lg})", "f": 0.0, "period": 0, "clock_txt": ""}
         out.append(((lg, ln["norm"], ln["stat"], None), ln, ev, a))
+    if CS2_FORM_ON:
+        try:
+            out += cs2_form_pregame(singles)
+        except Exception as e:                       # bo3.gg trouble never stops anything else
+            print("cs2 form error:", e)
     if time.time() - _state.get("es_log_t", 0) > 3600:
         _state["es_log_t"] = time.time()
         print(f"ESPORTS PREGAME CHECK: {len(singles)} single lines, {len(combos)} combos, {matched} combos matched to "
               f"their players, {len(out)} picks")
+    return out
+
+
+# ====================== CS2 PLAYER FORM (v3.0, free: bo3.gg) ======================
+# Single CS2 kill lines ("MAPS 1-2 Kills", "MAP 1 Kills"): the player's kills per round from bo3.gg's free public
+# stats, over the last 45 days AND the last 150 days, times the rounds those maps usually last. Both must land on the
+# same side of the line, the recent one by a clear gap. Unofficial source: if it fails, CS2 form picks just stop.
+CS2_FORM_ON = os.getenv("HB_CS2_FORM", "true").lower() == "true"
+CS2_ROUNDS_PER_MAP = float(os.getenv("HB_CS2_ROUNDS_PER_MAP", "21.5"))
+CS2_FETCH_PER_CYCLE = int(os.getenv("HB_CS2_FETCH_PER_CYCLE", "6"))
+CS2_GAP_PCT = float(os.getenv("HB_CS2_GAP_PCT", "0.10"))      # recent projection must be 10%+ away from the line
+CS2_RECENT_DAYS, CS2_LONG_DAYS = 45, 150
+BO3 = "https://api.bo3.gg/api/v1"
+_bo3 = requests.Session()
+_bo3.headers.update({"accept": "application/json, text/plain, */*", "origin": "https://bo3.gg", "referer": "https://bo3.gg/",
+                     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/122.0.0.0 Safari/537.36"})
+
+
+def _bo3_get(path, params):
+    if _state.get("cs2_budget", 0) <= 0 or time.time() < _state.get("bo3_block_until", 0):
+        return None
+    _state["cs2_budget"] -= 1
+    try:
+        r = _bo3.get(BO3 + path, params=params, timeout=12)
+        if r.status_code in (403, 429):
+            _state["bo3_block_until"] = time.time() + 900
+            print(f"bo3.gg said {r.status_code}: pausing CS2 form for 15 minutes")
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        _state["bo3_err"] = _state.get("bo3_err", 0) + 1
+        if _state["bo3_err"] <= 3:
+            print("bo3.gg error:", e)
+        return None
+
+
+def _cs2_slug(name):
+    cache = _state.setdefault("cs2_slug", {})
+    k = name.lower()
+    if k in cache:
+        return cache[k]
+    d = _bo3_get("/filters/players", {"page[limit]": 5, "filter[discipline_id][eq]": 1, "search_text": name})
+    if d is None:
+        return None
+    exact = [x for x in d.get("results", []) if (x.get("nickname") or "").lower() == k]
+    exact.sort(key=lambda x: (x.get("rank") is None, x.get("rank") or 0))     # the ranked (active pro) player first
+    cache[k] = exact[0]["slug"] if exact else ""
+    return cache[k]
+
+
+def _cs2_kpr(slug, days):
+    """(kills per round, rounds played) over the last `days` days, cached 12 hours."""
+    cache = _state.setdefault("cs2_stats", {})
+    hit = cache.get((slug, days))
+    if hit and time.time() - hit[0] < 12 * 3600:
+        return hit[1]
+    today = _now().date()
+    d = _bo3_get(f"/players/{slug}/general_stats", {"filter[start_date_from]": str(today - timedelta(days=days)),
+                                                    "filter[start_date_to]": str(today)})
+    if d is None:
+        return None
+    rounds = _num(d.get("rounds_count"), 0)
+    val = (_num(d.get("kills_sum"), 0) / rounds, rounds) if rounds > 0 else (0.0, 0)
+    cache[(slug, days)] = (time.time(), val)
+    return val
+
+
+def _cs2_maps(label):
+    """'MAPS 1-2 Kills' -> 2, 'MAP 1 Kills' -> 1. Map 3 is not always played, so lines that need it are skipped."""
+    t = label.lower()
+    if "kill" not in t or "headshot" in t or "hs" in t.split():
+        return None
+    m = re.search(r"maps?\s*(\d)(?:\s*-\s*(\d))?", t)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+    if b > 2 or b < a:
+        return None
+    return b - a + 1
+
+
+def cs2_form_pregame(singles):
+    _state["cs2_budget"] = CS2_FETCH_PER_CYCLE
+    out, lines, waiting = [], 0, 0
+    for (lg, key, norm), ln in singles.items():
+        if lg != "CS2":
+            continue
+        nmaps = _cs2_maps(STAT_LABEL.get(key, ""))
+        start = _upcoming([ln]) if nmaps else None
+        if not start:
+            continue
+        lines += 1
+        slug = _cs2_slug(ln["name"])
+        if slug is None:
+            waiting += 1
+            continue
+        if not slug:
+            continue                                   # not found on bo3.gg
+        rec, lon = _cs2_kpr(slug, CS2_RECENT_DAYS), _cs2_kpr(slug, CS2_LONG_DAYS)
+        if rec is None or lon is None:
+            waiting += 1
+            continue
+        if rec[1] < 120 or lon[1] < 300:
+            continue                                   # too few rounds played to trust
+        L = ln["line"]
+        rounds = CS2_ROUNDS_PER_MAP * nmaps
+        p_rec, p_lon = rec[0] * rounds, lon[0] * rounds
+        need = max(1.5 * nmaps, CS2_GAP_PCT * L)
+        g_rec, g_lon = p_rec - L, p_lon - L
+        if abs(g_rec) < need or g_lon * g_rec <= 0 or abs(g_lon) < 0.5 * need:
+            continue
+        direction = "OVER" if g_rec > 0 else "UNDER"
+        maps_txt = f"{nmaps} maps" if nmaps > 1 else "1 map"
+        notes = [f"✅ Last {CS2_RECENT_DAYS} days: {rec[0]:.2f} kills a round x {rounds:g} rounds ({maps_txt}) = {p_rec:.1f}",
+                 f"✅ Last {CS2_LONG_DAYS} days: {lon[0]:.2f} kills a round = {p_lon:.1f}",
+                 f"Line {L:g} → {direction}",
+                 "Short maps (a stomp) mean fewer kills for everyone, long maps (overtime) mean more",
+                 "Stats from bo3.gg (free, unofficial). Check the lineup before you lock"]
+        a = {"direction": direction, "proj": p_rec, "gap": g_rec, "cur": 0, "line": L, "margin": 0, "team": {},
+             "opp": {}, "notes": notes, "factor": 1.0, "moved": 0.0, "prob": 0.0,
+             "strength": abs(g_rec) / need, "shape": "PRE-pregame", "game": "ES" + str(ln.get("gid") or ln["team"]),
+             "pre": True, "sport": "CS2", "form": True,
+             "score_txt": f"{ln['team'] or 'CS2'} {ln['opp'] and 'vs ' + ln['opp']} • starts {_start_txt(start)}"}
+        ev = {"id": a["game"], "name": f"{ln['name']} (CS2) — recent and long-term form agree", "f": 0.0,
+              "period": 0, "clock_txt": ""}
+        out.append(((lg, norm, ln["stat"], None), ln, ev, a))
+    if time.time() - _state.get("cs2_log_t", 0) > 3600:
+        _state["cs2_log_t"] = time.time()
+        print(f"CS2 FORM CHECK: {lines} kill lines, {waiting} still loading from bo3.gg, {len(out)} picks")
     return out
 
 
@@ -2368,7 +2538,10 @@ def send_pair(c1, c2):
                             ". Lines move fast, so check both are still available before you lock.",
              "color": 15844367, "fields": fields,
              "footer": {"text": "Model v3.0 • alert only • projections, not guarantees"}}
-    _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
+    picks = "\n".join(f"**{i}. {l['name']} — {stat_label(l)} {a['direction']} {l['line']:g}**"
+                       for i, (_, l, _, a) in enumerate((c1, c2), 1))
+    # v3.0: the two picks also go in the plain message text, so they show even if Discord doesn't load the box
+    _post({"content": f"💓 {tag}PAIR\n{picks}"[:1900], "embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
     print(f"ALERT(pair) {' + '.join(legs)}")
 
 
