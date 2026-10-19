@@ -61,6 +61,7 @@ import requests
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # v2.0: pregame picks go to their own Discord channel when this is set (otherwise to WEBHOOK_URL, like before)
 PREGAME_WEBHOOK_URL = os.getenv("PREGAME_WEBHOOK_URL")
+ESPORTS_WEBHOOK_URL = os.getenv("ESPORTS_WEBHOOK_URL")   # v3.0: esports picks go to their own channel when this is set
 SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA,NHL").split(",") if s.strip()]
 PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
 # v1.9.2: PrizePicks takes pregame lines down at kickoff. In-game lines may only come from a second feed (in_game=true).
@@ -2505,6 +2506,15 @@ def _mark_sent(key, a):
         _state["pre_times"].append(time.time())
 
 
+def _channel(c):
+    """Esports -> ESPORTS channel (if set), other pregame -> PREGAME channel, live -> the main channel."""
+    if not c[3].get("pre"):
+        return None
+    if (c[3].get("sport") or c[1].get("sport")) in ("CS2", "LOL", "VAL") and ESPORTS_WEBHOOK_URL:
+        return ESPORTS_WEBHOOK_URL
+    return PREGAME_WEBHOOK_URL
+
+
 def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
@@ -2517,7 +2527,8 @@ def send_single(cand, label="no pair found"):
              "description": _leg_text(line, a), "color": color,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
              "footer": {"text": footer}}
-    _post({"embeds": [embed]}, PREGAME_WEBHOOK_URL if a.get("pre") else None)
+    txt = f"💓{tag} SINGLE\n**{line['name']} — {stat_label(line)} {a['direction']} {line['line']:g}**"
+    _post({"content": txt[:1900], "embeds": [embed]}, _channel(cand))
     print(f"ALERT(single{', CAUTION' if a.get('caution') else ''}) {line['sport']} {line['name']} {line.get('half') or 'full'} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
           f"{a['direction']} cur {a['cur']} margin {a['margin']} f={event['f']:.2f}")
 
@@ -2541,7 +2552,7 @@ def send_pair(c1, c2):
     picks = "\n".join(f"**{i}. {l['name']} — {stat_label(l)} {a['direction']} {l['line']:g}**"
                        for i, (_, l, _, a) in enumerate((c1, c2), 1))
     # v3.0: the two picks also go in the plain message text, so they show even if Discord doesn't load the box
-    _post({"content": f"💓 {tag}PAIR\n{picks}"[:1900], "embeds": [embed]}, PREGAME_WEBHOOK_URL if pre else None)
+    _post({"content": f"💓 {tag}PAIR\n{picks}"[:1900], "embeds": [embed]}, _channel(c1))
     print(f"ALERT(pair) {' + '.join(legs)}")
 
 
@@ -2553,11 +2564,25 @@ PRE_PAIRS_ONLY = os.getenv("HB_PRE_PAIRS_ONLY", "true").lower() == "true"
 LIVE_PAIRS_ONLY = os.getenv("HB_LIVE_PAIRS_ONLY", "true").lower() == "true"
 
 
+ES_SPORTS = ("CS2", "LOL", "VAL")
+# v3.0: esports pregame picks pair ONLY with other esports picks. With no esports partner, one posts alone after
+# HB_ES_SOLO_WAIT_MINUTES (10) so nobody waits for tonight's NHL/NBA games.
+ES_SOLO_WAIT = float(os.getenv("HB_ES_SOLO_WAIT_MINUTES", "10")) * 60
+
+
+def _is_es(c):
+    return c[3].get("sport") in ES_SPORTS
+
+
 def _pair_wait(c):
     """v2.5: live picks wait 75 seconds for a partner. Pregame picks have hours, so they wait up to 45 minutes,
     but always post alone by 1 hour before their game starts."""
     if not c[3].get("pre"):
         return PAIR_WAIT
+    if _is_es(c):
+        st = c[1].get("start")
+        left = (st - _now()).total_seconds() - 300 if st else ES_SOLO_WAIT
+        return max(0.0, min(ES_SOLO_WAIT, left))
     st = c[1].get("start")
     if not st:
         return PAIR_WAIT
@@ -2611,6 +2636,8 @@ def process_candidates(fresh):
                 continue
             if bool(c2[3].get("pre")) != bool(c1[3].get("pre")):     # pregame picks pair with pregame, live with live
                 continue
+            if c1[3].get("pre") and _is_es(c1) != _is_es(c2):        # v3.0: esports pair only with esports
+                continue
             same = c1[3]["shape"] == c2[3]["shape"]
             if PAIR_REQUIRE_SAME_SHAPE and not same:
                 continue
@@ -2624,8 +2651,8 @@ def process_candidates(fresh):
             used |= {c1[0], best[1][0]}
             posted += 1
     for c in ready:                                    # nobody to pair with: post alone once it has waited long enough
-        if PRE_PAIRS_ONLY and c[3].get("pre"):
-            continue                                   # v2.6: pregame picks only ever post as a PAIR
+        if PRE_PAIRS_ONLY and c[3].get("pre") and not _is_es(c):
+            continue                                   # v2.6: pregame picks only ever post as a PAIR (esports: see ES_SOLO_WAIT)
         if LIVE_PAIRS_ONLY and not c[3].get("pre"):
             continue                                   # v3.0: live picks only ever post as a PAIR
         if c[0] not in used and now - _state["pending"].get(c[0], now) >= _pair_wait(c):
