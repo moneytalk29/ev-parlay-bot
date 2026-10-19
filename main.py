@@ -61,7 +61,9 @@ import requests
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # v2.0: pregame picks go to their own Discord channel when this is set (otherwise to WEBHOOK_URL, like before)
 PREGAME_WEBHOOK_URL = os.getenv("PREGAME_WEBHOOK_URL")
-ESPORTS_WEBHOOK_URL = os.getenv("ESPORTS_WEBHOOK_URL")   # v3.0: esports picks go to their own channel when this is set
+ESPORTS_WEBHOOK_URL = os.getenv("ESPORTS_WEBHOOK_URL") or next(   # v3.0: also accepts a near-miss name like ESPORT_WEBHOOK
+    (v.strip() for k, v in os.environ.items() if k.strip().upper().startswith("ESPORT") and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)   # v3.0: esports picks go to their own channel when this is set
 SPORTS = [s.strip().upper() for s in os.getenv("HB_SPORTS", "NFL,NBA,NHL").split(",") if s.strip()]
 PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
 # v1.9.2: PrizePicks takes pregame lines down at kickoff. In-game lines may only come from a second feed (in_game=true).
@@ -2073,6 +2075,11 @@ def esports_pregame(raw):
         parts = [x.strip() for x in re.split(r"\s*\+\s*", ln["name"]) if x.strip()]
         legs = [singles.get((lg, key, _norm(x))) for x in parts]
         if len(parts) < 2 or not all(legs):
+            if len(_state.setdefault("es_miss", [])) < 3:       # v3.0: show why a combo didn't match (for fixing)
+                near = [ln2["name"] for (l2, k2, _), ln2 in singles.items() if l2 == lg and k2 == key][:4]
+                _state["es_miss"].append(1)
+                print(f"ESPORTS COMBO NOT MATCHED: name '{ln['name']}' stat '{STAT_LABEL.get(key + '_c', key)}' "
+                      f"parts {parts} found {[bool(x) for x in legs]} | singles with that stat: {near}")
             continue
         matched += 1
         total = sum(x["line"] for x in legs)
@@ -2715,6 +2722,8 @@ def discovery_report(board, live):
     lines.append("Tennis alerts: " + (f"ON (only picks that hit in {T_MIN_PROB:.0%}+ of simulations)" if TENNIS_ON else "off"))
     lines.append("Pregame line check: " + (f"ON (max {PRE_MAX_LEGS} picks an hour)" if PREGAME_ON else "off")
                  + (" → posts to the PREGAME channel" if PREGAME_WEBHOOK_URL else " → same channel (no PREGAME_WEBHOOK_URL yet)"))
+    lines.append("Esports picks → " + ("their own ESPORTS channel" if ESPORTS_WEBHOOK_URL else
+                                       "the PREGAME channel (no ESPORTS_WEBHOOK_URL found)"))
     lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
