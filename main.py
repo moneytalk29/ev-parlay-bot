@@ -2531,6 +2531,10 @@ def _channel(c):
     return PREGAME_WEBHOOK_URL
 
 
+PP_BOARD_URL = os.getenv("HB_PP_LINK", "https://app.prizepicks.com/board")
+PP_LINK_TXT = f"👉 [Open PrizePicks](<{PP_BOARD_URL}>) (search the player name)"   # v3.0: one tap to the board
+
+
 def send_single(cand, label="no pair found"):
     key, line, event, a = cand
     _mark_sent(key, a)
@@ -2543,7 +2547,7 @@ def send_single(cand, label="no pair found"):
              "description": _leg_text(line, a), "color": color,
              "fields": [{"name": event["name"], "value": _score_text(event, a), "inline": False}],
              "footer": {"text": footer}}
-    txt = f"💓{tag} SINGLE\n**{line['name']} — {stat_label(line)} {a['direction']} {line['line']:g}**"
+    txt = f"💓{tag} SINGLE\n**{line['name']} — {stat_label(line)} {a['direction']} {line['line']:g}**\n{PP_LINK_TXT}"
     _post({"content": txt[:1900], "embeds": [embed]}, _channel(cand))
     print(f"ALERT(single{', CAUTION' if a.get('caution') else ''}) {line['sport']} {line['name']} {line.get('half') or 'full'} {line['stat']} line {line['line']} proj {a['proj']:.1f} "
           f"{a['direction']} cur {a['cur']} margin {a['margin']} f={event['f']:.2f}")
@@ -2568,7 +2572,7 @@ def send_pair(c1, c2):
     picks = "\n".join(f"**{i}. {l['name']} — {stat_label(l)} {a['direction']} {l['line']:g}**"
                        for i, (_, l, _, a) in enumerate((c1, c2), 1))
     # v3.0: the two picks also go in the plain message text, so they show even if Discord doesn't load the box
-    _post({"content": f"💓 {tag}PAIR\n{picks}"[:1900], "embeds": [embed]}, _channel(c1))
+    _post({"content": f"💓 {tag}PAIR\n{picks}\n{PP_LINK_TXT}"[:1900], "embeds": [embed]}, _channel(c1))
     print(f"ALERT(pair) {' + '.join(legs)}")
 
 
