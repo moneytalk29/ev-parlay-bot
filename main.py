@@ -2247,7 +2247,7 @@ def cs2_form_pregame(singles):
 NBA_FORM_STATS = ("pts", "reb", "ast", "fg3", "pra", "pr", "pa", "ra", "fant")
 NBA_FORM_GAP = {"pts": 3.0, "reb": 1.5, "ast": 1.5, "fg3": 0.8, "pra": 4.0, "pr": 3.0, "pa": 3.0, "ra": 2.0, "fant": 5.0}
 NBA_SCORING = ("pts", "fg3", "pra", "pr", "pa", "fant")       # stats the opponent's points allowed says something about
-NBA_MIN_MINUTES = float(os.getenv("HB_NBA_FORM_MIN_MINUTES", "20"))
+NBA_MIN_MINUTES = float(os.getenv("HB_NBA_FORM_MIN_MINUTES", "28"))
 NBA_TEAM_ALIAS = {"NYK": "NY", "GSW": "GS", "SAS": "SA", "NOP": "NO", "NOR": "NO", "UTA": "UTAH", "UTH": "UTAH",
                   "WAS": "WSH", "PHO": "PHX", "BRK": "BKN", "BRO": "BKN", "CHO": "CHA", "NJN": "BKN"}
 
@@ -2342,6 +2342,7 @@ def _nba_game_box(eid):
         return None
     players = {}
     for team in (d.get("boxscore") or {}).get("players", []) or []:
+        btid = str((team.get("team") or {}).get("id") or "")
         for cat in team.get("statistics", []) or []:
             labels = cat.get("labels") or []
             for ath in cat.get("athletes", []) or []:
@@ -2356,10 +2357,165 @@ def _nba_game_box(eid):
                 made, _ = _split_pair(row.get("3PT"))
                 p = {"minutes": mins, "pts": _num(row.get("PTS")), "reb": _num(row.get("REB")),
                      "ast": _num(row.get("AST")), "fg3": float(made), "stl": _num(row.get("STL")),
-                     "blk": _num(row.get("BLK")), "tov": _num(row.get("TO"))}
+                     "blk": _num(row.get("BLK")), "tov": _num(row.get("TO")), "tid": btid}
                 players[nm] = derive(p)
     cache[eid] = players
     return players
+
+
+NBA_SOFT_STATS = ("fant", "pra", "pts", "pr", "pa")
+NBA_SOFT_MIN = float(os.getenv("HB_NBA_SOFT_MINUTES", "30"))    # "main player" for the soft-matchup play
+NBA_SOFT_RATIO = float(os.getenv("HB_NBA_SOFT_RATIO", "1.04"))  # opponent allows 4%+ more points than average
+NBA_STARTER_MIN = float(os.getenv("HB_NBA_STARTER_MINUTES", "28"))   # v3.0: NBA picks only for heavy-minute players
+NBA_MATCHUP_EDGE = float(os.getenv("HB_NBA_MATCHUP_EDGE", "0.02"))     # opponent must allow 2%+ more (OVER) / less (UNDER)
+
+
+def _nba_season_allowed(tid):
+    """(this season's points allowed a game, games this season, last season's full points allowed a game). 6h cache."""
+    sc = _state.setdefault("nba_season_al", {})
+    hit = sc.get(tid)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    y, now, res = _nba_season_year(), _now(), []
+    for yr in (y, y - 1):
+        vals = []
+        try:
+            d = _get_json(f"{ESPN['NBA']}/teams/{tid}/schedule?season={yr}&seasontype=2")
+            for ev in d.get("events", []) or []:
+                dt = _to_dt(ev.get("date"))
+                comp = (ev.get("competitions") or [{}])[0]
+                if not dt or (now - dt).total_seconds() < 4 * 3600 or \
+                        (((comp.get("status") or {}).get("type") or {}).get("completed")) is False:
+                    continue
+                for c in comp.get("competitors", []) or []:
+                    if str((c.get("team") or {}).get("id")) != str(tid):
+                        v = _score_val(c.get("score"))
+                        if v:
+                            vals.append(v)
+        except Exception as e:
+            print(f"NBA schedule error ({tid} {yr}):", e)
+        res.append(vals)
+    this, last = res
+    out = (sum(this) / len(this) if this else None, len(this), sum(last) / len(last) if last else None)
+    sc[tid] = (time.time(), out)
+    return out
+
+
+def _nba_fant_allowed(tid):
+    """Fantasy score and PRA the team's OPPONENTS put up a game, over its last 10 games (box scores). None = loading."""
+    f, pra, n = 0.0, 0.0, 0
+    for eid, _al in _nba_team_games(tid):
+        box = _nba_game_box(eid)
+        if box is None:
+            return None
+        opp = [r for r in box.values() if r.get("tid") and r["tid"] != str(tid)]
+        if opp:
+            f += sum(r["fant"] for r in opp)
+            pra += sum(r["pra"] for r in opp)
+            n += 1
+    return (f / n, pra / n) if n >= 5 else None
+
+
+def _nba_allowed(teams):
+    """v3.0 'how soft is this defense', as a points-allowed number (league average = normal):
+    points allowed (last season's full season, blended with this season as games come in: by game 15 they count
+    equally), plus fantasy score and PRA allowed over the last 10 games once those box scores are loaded."""
+    hit = _state.get("nba_allowed")
+    if hit and time.time() - hit[0] < 3 * 3600 and hit[1]:
+        return hit[1]
+    pts, fan, det = {}, {}, {}
+    for tid in teams:
+        this, n, last = _nba_season_allowed(tid)
+        if this is None and last is None:
+            continue
+        pts[tid] = this if last is None else last if this is None else (n * this + 15 * last) / (n + 15)
+        fa = _nba_fant_allowed(tid)
+        if fa:
+            fan[tid] = fa
+    if len(pts) < 20:
+        return {}
+    lgp = sum(pts.values()) / len(pts)
+    use_f = len(fan) >= 20
+    lgf = sum(v[0] for v in fan.values()) / len(fan) if use_f else 0
+    lgr = sum(v[1] for v in fan.values()) / len(fan) if use_f else 0
+    out = {}
+    for tid, p in pts.items():
+        r = p / lgp
+        if use_f and tid in fan:
+            r = (r + fan[tid][0] / lgf + fan[tid][1] / lgr) / 3
+        out[tid] = lgp * r
+        det[tid] = (p, fan.get(tid))
+    _state["nba_soft_detail"] = (det, lgp, (lgf, lgr) if use_f else None)
+    if use_f:                                   # full table: keep it 3 hours. Points-only table: rebuild next cycle
+        _state["nba_allowed"] = (time.time(), out)
+    return out
+
+
+def _nba_matchup_txt(teams, opp):
+    det, lgp, lgfr = _state.get("nba_soft_detail", ({}, 0, None))
+    p, fa = det.get(opp, (None, None))
+    abbr = teams.get(opp, {}).get("abbr", "?")
+    if p is None:
+        return abbr
+    txt = f"{abbr} allow {p:.1f} points a game (league {lgp:.1f})"
+    if fa and lgfr:
+        txt += f", {fa[0]:.0f} fantasy pts (league {lgfr[0]:.0f}) and {fa[1]:.0f} PRA (league {lgfr[1]:.0f}) to opponents"
+    return txt
+
+
+def _nba_minutes(tid, norm):
+    """His minutes in his last 5 games for his CURRENT team (newest first). None = box scores still loading."""
+    mins = []
+    for eid, _al in _nba_team_games(tid):
+        box = _nba_game_box(eid)
+        if box is None:
+            return None
+        r = box.get(norm)
+        if r:
+            mins.append(r["minutes"])
+        if len(mins) >= 5:
+            break
+    return mins
+
+
+def nba_gate(cands):
+    """v3.0: every NBA pregame pick must be (1) a heavy-minute player (28+ minutes a game lately for his current team)
+    and (2) facing a defense that helps: OVER only vs a team that allows more points than average, UNDER only vs one
+    that allows fewer. Bench players and neutral/bad matchups are dropped."""
+    out, dropped = [], 0
+    teams = None
+    for c in cands:
+        key, ln, ev, a = c
+        if (a.get("sport") or ln.get("sport")) != "NBA":
+            out.append(c)
+            continue
+        teams = teams or nba_teams()
+        mine, opp = _nba_team(teams, ln.get("team")), _nba_team(teams, ln.get("opp"))
+        if not mine or not opp:
+            dropped += 1
+            continue
+        mins = _nba_minutes(mine, ln["norm"])
+        if not mins or len(mins) < 2 or sum(mins) / len(mins) < NBA_STARTER_MIN:
+            dropped += 1
+            continue
+        allowed = _nba_allowed(teams)
+        if opp not in allowed:
+            dropped += 1
+            continue
+        lg = sum(allowed.values()) / len(allowed)
+        ratio = allowed[opp] / lg
+        if (a["direction"] == "OVER" and ratio < 1 + NBA_MATCHUP_EDGE) or \
+                (a["direction"] == "UNDER" and ratio > 1 - NBA_MATCHUP_EDGE):
+            dropped += 1
+            continue
+        notes = [n for n in a.get("notes", []) if "Matchup" not in n]
+        a["notes"] = [f"⭐ Starter: {sum(mins) / len(mins):.0f} minutes a game lately",
+                      f"✅ Matchup: {_nba_matchup_txt(teams, opp)}"] + notes
+        out.append(c)
+    if dropped and time.time() - _state.get("nba_gate_log_t", 0) > 3600:
+        _state["nba_gate_log_t"] = time.time()
+        print(f"NBA GATE: {dropped} NBA pregame picks dropped (bench minutes, unknown team, or matchup not helping)")
+    return out
 
 
 def nba_form_pregame(board):
@@ -2391,7 +2547,7 @@ def nba_form_pregame(board):
             waiting += 1
             continue
         checked += 1
-        if len(vals) < FORM_MIN_PLAYED or sum(mins) / len(mins) < NBA_MIN_MINUTES:
+        if not vals or sum(mins) / len(mins) < NBA_MIN_MINUTES:
             continue
         stat, L = ln["stat"], ln["line"]
         n = len(vals)
@@ -2400,21 +2556,28 @@ def nba_form_pregame(board):
         good = sum(1 for v in vals if (v > L if direction == "OVER" else v < L))
         rate = good / n
         need = max(NBA_FORM_GAP[stat], 0.10 * L)
-        if rate < FORM_RATE or abs(avg - L) < need:
+        # v3.0 SOFT-MATCHUP PLAY: a main player (30+ min) facing one of the softest defenses -> his OVER needs less
+        # proof (60%+ of games over, average above the line, 3+ games with his current team).
+        soft = False
+        if opp and stat in NBA_SOFT_STATS and direction == "OVER" and sum(mins) / len(mins) >= NBA_SOFT_MIN:
+            al = _nba_allowed(teams)
+            if opp in al:
+                lg0 = sum(al.values()) / len(al)
+                soft = (al[opp] / lg0 >= NBA_SOFT_RATIO and n >= 3 and rate >= 0.6 and avg - L >= 0.5 * need)
+        if not soft and (n < FORM_MIN_PLAYED or rate < FORM_RATE or abs(avg - L) < need):
             continue
         reasons = [f"✅ {good} of his last {n} games went {direction} {L:g}",
                    f"✅ Averaging {avg:.1f} vs a line of {L:g} ({sum(mins) / len(mins):.0f} minutes a game)"]
+        if soft:
+            reasons.insert(0, "🎯 Soft-matchup play: main player vs one of the softest defenses")
         r3 = False
         if opp and stat in NBA_SCORING:
             if not allowed:
-                for tid in teams:
-                    g = [al for _, al in _nba_team_games(tid) if al]
-                    if len(g) >= 5:
-                        allowed[tid] = sum(g) / len(g)
+                allowed = _nba_allowed(teams)
             if opp in allowed and allowed:
                 lg = sum(allowed.values()) / len(allowed)
                 ratio = allowed[opp] / lg
-                what = f"{teams[opp]['abbr']} allow {allowed[opp]:.1f} points a game (league {lg:.1f})"
+                what = _nba_matchup_txt(teams, opp)
                 if (direction == "OVER" and ratio >= 1.04) or (direction == "UNDER" and ratio <= 0.96):
                     r3 = True
                     reasons.append(f"✅ Matchup helps: {what}")
@@ -2967,6 +3130,11 @@ def cycle(first=False):
                 pre_fresh += nba_form_pregame(board)
         except Exception as e:                      # the pregame check can never stop live alerts
             print("pregame error:", e)
+        try:
+            pre_fresh = nba_gate(pre_fresh)        # v3.0: NBA = starters only, and only with a matchup that helps
+        except Exception as e:
+            print("nba gate error:", e)
+            pre_fresh = [c for c in pre_fresh if (c[3].get("sport") or c[1].get("sport")) != "NBA"]
     fresh += pre_fresh
     sent = process_candidates(fresh)
     n_live = sum(len(v) for v in live.values())
