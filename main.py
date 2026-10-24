@@ -2329,18 +2329,27 @@ def error_scan(raw):
                                       f"🏷️ Promo / discounted line {d:g} vs his standard line {s0:g}. "
                                       f"PrizePicks put this one on sale, so it's way easier than normal: take the More"))
             # 2) combo line at or below one of its own parts
-            if std and "+" in stat:
+            # v3.0 fix: only compare like with like. A yards combo vs yards parts, an NBA combo vs its NBA parts.
+            # Anything with another unit (TDs, attempts, completions...) is skipped, and the part line must be close
+            # to the combo line (a real mistake is a near miss, not 1.5 vs 227.5).
+            words = set(re.findall(r"[a-z]+", stat))
+            yards = bool(words & {"yds", "yards"})
+            other_unit = bool(words - {"yds", "yards", "pts", "rebs", "asts", "blks", "stls", "rush", "rec", "pass",
+                                       "points", "rebounds", "assists", "receiving"})
+            if std and "+" in stat and not other_unit:
                 base = re.sub(r"\b(yds|yards)\b", "", stat).strip()
                 parts = [x.strip() for x in base.split("+") if x.strip()]
                 part_names = []
                 for x in parts:
                     nm = _ERR_PART.get(x.split()[0])
-                    if nm:
-                        part_names.append(nm)
+                    if not nm or (yards != nm.endswith("yards")):
+                        part_names = []
+                        break
+                    part_names.append(nm)
                 c0 = min(std)
                 for pn in part_names:
                     ps = (L.get(pn) or {}).get("standard")
-                    if ps and c0 <= max(ps):
+                    if ps and c0 <= max(ps) <= c0 * 1.5:
                         found.append((lg, P, stat, "standard", c0, "MORE",
                                       f"{stat.title()} line {c0:g} is at or below his {pn.title()} line {max(ps):g} on its own. "
                                       f"The combo always counts at least that much, so this is a PrizePicks mistake: take the combo More"))
