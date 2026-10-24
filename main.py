@@ -489,7 +489,8 @@ def save_state(force=False):
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
             used = [[list(k)] + list(v) for k, v in _state.get("used_props", {}).items() if now - v[0] < PROP_ONCE_H * 3600]
-            json.dump({"v": 1, "prior": keep, "used": used}, f)
+            errs = [[k, t] for k, t in _state.get("err_sent", {}).items() if now - t < 36 * 3600]
+            json.dump({"v": 1, "prior": keep, "used": used, "errs": errs}, f)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         if now - _state.get("save_err_t", 0) > 3600:
@@ -516,6 +517,9 @@ def load_state():
             _state["prior"][key] = v
             pt[key] = t
             n += 1
+    for k, t in d.get("errs", []):                   # line errors already posted stay posted after a restart
+        if now - t < 36 * 3600:
+            _state.setdefault("err_sent", {})[k] = t
     for row in d.get("used", []):                   # v3.0: props already posted stay "used" after a restart
         k, v = row[0], (list(row[1:]) + [None, None])[:3]
         if v[0] and now - v[0] < PROP_ONCE_H * 3600:
@@ -2241,6 +2245,159 @@ def cs2_form_pregame(singles):
     return out
 
 
+# ====================== LINE ERRORS (v3.0, all sports, own channel) ======================
+# Posts ONLY when PrizePicks' own lines contradict each other (a pricing mistake), so the channel stays quiet:
+#   1) a 😈 DEMON line that is at or BELOW the same player's standard line (a demon is supposed to be harder)
+#   2) a combo line (PRA, Pts+Rebs, Rush+Rec Yds, Kills combos...) at or BELOW one of its own parts' lines
+#   3) NBA: a demon line his recent games clear easily (8+ of his last 10, average well above it)
+# Needs ERRORS_WEBHOOK_URL (any variable name with ERROR + WEBHOOK). Without it, errors are only written to the log.
+ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
+    (v.strip() for k, v in os.environ.items() if "ERROR" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
+ERR_ON = os.getenv("HB_ERRORS", "true").lower() == "true"
+_ERR_PART = {"pts": "points", "points": "points", "rebs": "rebounds", "reb": "rebounds", "rebounds": "rebounds",
+             "asts": "assists", "ast": "assists", "assists": "assists", "blks": "blocked shots", "blocks": "blocked shots",
+             "stls": "steals", "steals": "steals", "rush": "rush yards", "rec": "receiving yards", "receiving": "receiving yards",
+             "pass": "pass yards", "goals": "goals", "sog": "shots on goal"}
+
+
+def _err_norm_stat(t):
+    return re.sub(r"\s+", " ", re.sub(r"[()]", " ", str(t or "").lower())).strip()
+
+
+def error_scan(raw):
+    players, leagues, games = {}, {}, {}
+    for inc in raw.get("included", []) or []:
+        a = inc.get("attributes", {}) or {}
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = (a.get("name", ""), a.get("team") or "", )
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    rows, types = {}, {}
+    now = _now()
+    for item in raw.get("data", []) or []:
+        try:
+            if item.get("_live_feed"):
+                continue
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            if str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true":
+                continue
+            st = _to_dt(a.get("start_time"))
+            if not st or st <= now or (st - now).total_seconds() > PRE_WINDOW_H * 3600:
+                continue
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            name, team = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), ("", ""))
+            line = _num(a.get("line_score"))
+            if not lg or not name or line <= 0 or " + " in name:
+                continue
+            ot = str(a.get("odds_type") or "standard").lower()
+            stat = _err_norm_stat(a.get("stat_display_name") or a.get("stat_type"))
+            if "combo" in stat:
+                continue
+            P = rows.setdefault((lg, _norm(name)), {"name": name, "team": team, "start": st, "opp": a.get("description") or "",
+                                                     "gid": (rel.get("game", {}).get("data") or {}).get("id"), "lines": {}})
+            promo = str(a.get("is_promo")).lower() == "true"
+            flash = _num(a.get("flash_sale_line_score"), 0)
+            kind = "promo" if promo else ot                   # v3.0: PrizePicks promo/discount lines are checked too
+            types[kind] = types.get(kind, 0) + 1
+            P["lines"].setdefault(stat, {}).setdefault(kind, []).append(line)
+            if flash and flash != line:                       # a flash-sale price on this line
+                P["lines"][stat].setdefault("promo", []).append(flash)
+                types["flash"] = types.get("flash", 0) + 1
+        except Exception:
+            continue
+    found = []
+    for (lg, norm), P in rows.items():
+        L = P["lines"]
+        for stat, by in L.items():
+            std = by.get("standard")
+            # 1) demon at or below the standard line
+            if std and by.get("demon"):
+                s0 = min(std)
+                for d in sorted(set(by["demon"])):
+                    if d <= s0:
+                        found.append((lg, P, stat, "demon", d, "MORE",
+                                      f"😈 Demon line {d:g} is at or below his standard line {s0:g}. A demon should be harder "
+                                      f"than the standard line, so this is a PrizePicks mistake: take the DEMON More"))
+            # 1b) a promo / flash-sale line far below the standard line (PrizePicks discount: worth knowing)
+            if std and by.get("promo"):
+                s0 = min(std)
+                for d in sorted(set(by["promo"])):
+                    if d <= s0 * 0.8:
+                        found.append((lg, P, stat, "promo", d, "MORE",
+                                      f"🏷️ Promo / discounted line {d:g} vs his standard line {s0:g}. "
+                                      f"PrizePicks put this one on sale, so it's way easier than normal: take the More"))
+            # 2) combo line at or below one of its own parts
+            if std and "+" in stat:
+                base = re.sub(r"\b(yds|yards)\b", "", stat).strip()
+                parts = [x.strip() for x in base.split("+") if x.strip()]
+                part_names = []
+                for x in parts:
+                    nm = _ERR_PART.get(x.split()[0])
+                    if nm:
+                        part_names.append(nm)
+                c0 = min(std)
+                for pn in part_names:
+                    ps = (L.get(pn) or {}).get("standard")
+                    if ps and c0 <= max(ps):
+                        found.append((lg, P, stat, "standard", c0, "MORE",
+                                      f"{stat.title()} line {c0:g} is at or below his {pn.title()} line {max(ps):g} on its own. "
+                                      f"The combo always counts at least that much, so this is a PrizePicks mistake: take the combo More"))
+                        break
+    # 3) NBA demon lines his last 10 games clear easily (box scores already loaded for the NBA form check)
+    try:
+        teams = nba_teams() if any(lg == "NBA" for lg, _ in rows) else {}
+        for (lg, norm), P in rows.items():
+            if lg != "NBA" or not teams:
+                continue
+            tid = _nba_team(teams, P["team"])
+            if not tid:
+                continue
+            for stat, by in P["lines"].items():
+                if not by.get("demon"):
+                    continue
+                cl = classify_nba(stat)
+                if not cl or cl[1]:
+                    continue
+                vals = []
+                for eid, _al in _nba_team_games(tid):
+                    box = _state.get("nba_box", {}).get(eid)
+                    if box and box.get(norm):
+                        vals.append(box[norm][cl[0]])
+                if len(vals) < 5:
+                    continue
+                avg = sum(vals) / len(vals)
+                for d in sorted(set(by["demon"])):
+                    hit = sum(1 for v in vals if v > d)
+                    if hit / len(vals) >= 0.8 and avg >= d * 1.2:
+                        found.append((lg, P, stat, "demon", d, "MORE",
+                                      f"😈 Demon line {d:g}, but he went over it in {hit} of his last {len(vals)} games "
+                                      f"(averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
+    except Exception as e:
+        print("error scan (NBA form) error:", e)
+    if time.time() - _state.get("err_log_t", 0) > 3600:
+        _state["err_log_t"] = time.time()
+        print(f"LINE ERROR CHECK: line types on the board {types} | {len(found)} errors found | "
+              f"channel {'set' if ERRORS_WEBHOOK_URL else 'NOT SET (log only)'}")
+    sent = _state.setdefault("err_sent", {})
+    for lg, P, stat, ot, line, direction, why in found:
+        k = f"{lg}|{P['name']}|{stat}|{ot}|{line:g}"
+        if k in sent:
+            continue
+        sent[k] = time.time()
+        label = {"demon": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
+        title = f"🚨 LINE ERROR — {lg}: {P['name']} {stat.title()}{label} {direction} {line:g}"
+        print("LINE ERROR:", title, "|", why)
+        if ERRORS_WEBHOOK_URL:
+            embed = {"title": title, "description": why, "color": 15158332,
+                     "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
+                                 "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}", "inline": False}],
+                     "footer": {"text": "Model v3.0 • alert only • PrizePicks can fix a mistake fast, so check it's still there"}}
+            _post({"content": f"🚨 **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n{PP_LINK_TXT}"[:1900],
+                   "embeds": [embed]}, ERRORS_WEBHOOK_URL)
+
+
 # ====================== NBA PREGAME RECENT FORM (v2.7) ======================
 # Like NHL: the player's last 10 games (this season first, topped up with last season's games for the SAME team),
 # plus the opponent's points allowed as the matchup. Posts only when 2+ reasons agree and the matchup isn't against it.
@@ -2891,6 +3048,8 @@ def discovery_report(board, live):
                  + (" → posts to the PREGAME channel" if PREGAME_WEBHOOK_URL else " → same channel (no PREGAME_WEBHOOK_URL yet)"))
     lines.append("Esports picks → " + ("their own ESPORTS channel" if ESPORTS_WEBHOOK_URL else
                                        "the PREGAME channel (no ESPORTS_WEBHOOK_URL found)"))
+    lines.append("Line errors → " + ("their own ERRORS channel" if ERRORS_WEBHOOK_URL else
+                                     "log only (no ERRORS_WEBHOOK_URL found)"))
     lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
@@ -3136,6 +3295,11 @@ def cycle(first=False):
             print("nba gate error:", e)
             pre_fresh = [c for c in pre_fresh if (c[3].get("sport") or c[1].get("sport")) != "NBA"]
     fresh += pre_fresh
+    if ERR_ON:
+        try:
+            error_scan(raw)                         # v3.0: pricing mistakes -> their own quiet channel
+        except Exception as e:
+            print("line error scan error:", e)
     sent = process_candidates(fresh)
     n_live = sum(len(v) for v in live.values())
     if n_live or first or t_fresh or sent:
