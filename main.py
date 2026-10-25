@@ -2255,6 +2255,9 @@ ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
     (v.strip() for k, v in os.environ.items() if "ERROR" in k.upper() and "WEBHOOK" in k.upper()
      and v.strip().startswith("http")), None)
 ERR_ON = os.getenv("HB_ERRORS", "true").lower() == "true"
+ERR_CONFIRM_S = float(os.getenv("HB_ERRORS_CONFIRM_SECONDS", "180"))   # must still be on the board 3 minutes later
+# v3.0: leagues to leave out of the error check (college props aren't allowed in every state). Comma list, PrizePicks names.
+ERR_SKIP = {x.strip().upper() for x in os.getenv("HB_ERRORS_SKIP_LEAGUES", "").split(",") if x.strip()}
 _ERR_PART = {"pts": "points", "points": "points", "rebs": "rebounds", "reb": "rebounds", "rebounds": "rebounds",
              "asts": "assists", "ast": "assists", "assists": "assists", "blks": "blocked shots", "blocks": "blocked shots",
              "stls": "steals", "steals": "steals", "rush": "rush yards", "rec": "receiving yards", "receiving": "receiving yards",
@@ -2289,13 +2292,17 @@ def error_scan(raw):
             lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
             name, team = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), ("", ""))
             line = _num(a.get("line_score"))
-            if not lg or not name or line <= 0 or " + " in name:
+            if not lg or not name or line <= 0 or " + " in name or lg in ERR_SKIP:
                 continue
+            if re.search(r"[1-4]Q$|QTR|QUARTER", lg) or re.search(r"\b(1q|2q|3q|4q|1st quarter|quarter)\b",
+                                                                         str(a.get("stat_display_name") or "").lower()):
+                continue                                  # v3.0: no quarter lines (one foul and it's gone)
             ot = str(a.get("odds_type") or "standard").lower()
             stat = _err_norm_stat(a.get("stat_display_name") or a.get("stat_type"))
             if "combo" in stat:
                 continue
-            P = rows.setdefault((lg, _norm(name)), {"name": name, "team": team, "start": st, "opp": a.get("description") or "",
+            gid0 = (rel.get("game", {}).get("data") or {}).get("id")
+            P = rows.setdefault((lg, _norm(name), gid0), {"name": name, "team": team, "start": st, "opp": a.get("description") or "",
                                                      "gid": (rel.get("game", {}).get("data") or {}).get("id"), "lines": {}})
             promo = str(a.get("is_promo")).lower() == "true"
             flash = _num(a.get("flash_sale_line_score"), 0)
@@ -2308,10 +2315,12 @@ def error_scan(raw):
         except Exception:
             continue
     found = []
-    for (lg, norm), P in rows.items():
+    for (lg, norm, _g), P in rows.items():
         L = P["lines"]
         for stat, by in L.items():
             std = by.get("standard")
+            if std and len(set(std)) > 1:
+                continue                                  # v3.0: two different regular lines at once = PrizePicks mid-move
             # 1) demon at or below the standard line
             if std and by.get("demon"):
                 s0 = min(std)
@@ -2320,6 +2329,14 @@ def error_scan(raw):
                         found.append((lg, P, stat, "demon", d, "MORE",
                                       f"😈 Demon line {d:g} is at or below his standard line {s0:g}. A demon should be harder "
                                       f"than the standard line, so this is a PrizePicks mistake: take the DEMON More"))
+            # 1c) a GOBLIN at or above the regular line: then the REGULAR line is the easier one and pays more
+            if std and by.get("goblin"):
+                s0 = max(std)
+                g = max(by["goblin"])
+                if g >= s0:
+                    found.append((lg, P, stat, "standard", s0, "MORE",
+                                  f"👺 Goblin line {g:g} is at or above his regular line {s0:g}. A goblin should be easier "
+                                  f"than the regular line, so the regular {s0:g} is the mistake: take the regular More"))
             # 1b) a promo / flash-sale line far below the standard line (PrizePicks discount: worth knowing)
             if std and by.get("promo"):
                 s0 = min(std)
@@ -2356,15 +2373,15 @@ def error_scan(raw):
                         break
     # 3) NBA demon lines his last 10 games clear easily (box scores already loaded for the NBA form check)
     try:
-        teams = nba_teams() if any(lg == "NBA" for lg, _ in rows) else {}
-        for (lg, norm), P in rows.items():
+        teams = nba_teams() if any(k[0] == "NBA" for k in rows) else {}
+        for (lg, norm, _g), P in rows.items():
             if lg != "NBA" or not teams:
                 continue
             tid = _nba_team(teams, P["team"])
             if not tid:
                 continue
             for stat, by in P["lines"].items():
-                if not by.get("demon"):
+                if not by.get("demon") and not by.get("standard"):
                     continue
                 cl = classify_nba(stat)
                 if not cl or cl[1]:
@@ -2374,13 +2391,27 @@ def error_scan(raw):
                     box = _state.get("nba_box", {}).get(eid)
                     if box and box.get(norm):
                         vals.append(box[norm][cl[0]])
-                if len(vals) < 5:
+                if len(vals) < 8:                       # v3.0: 8+ games, or it's too thin to call a mistake
                     continue
                 avg = sum(vals) / len(vals)
-                for d in sorted(set(by["demon"])):
+                # v3.0: a REGULAR line way off his recent games (90%+ of 8+ games on one side, average 30% away)
+                for sl in sorted(set(by.get("standard") or [])):
+                    if sl < 3:
+                        continue
+                    over = sum(1 for v in vals if v > sl)
+                    under = sum(1 for v in vals if v < sl)
+                    if over / len(vals) >= 0.9 and avg >= sl * 1.3:
+                        found.append((lg, P, stat, "standard", sl, "MORE",
+                                      f"Regular line {sl:g} is way under his recent games: over it in {over} of his last "
+                                      f"{len(vals)} (averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
+                    elif under / len(vals) >= 0.9 and avg <= sl * 0.7:
+                        found.append((lg, P, stat, "standard", sl, "LESS",
+                                      f"Regular line {sl:g} is way over his recent games: under it in {under} of his last "
+                                      f"{len(vals)} (averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
+                for d in sorted(set(by.get("demon") or [])):
                     hit = sum(1 for v in vals if v > d)
                     if hit / len(vals) >= 0.8 and avg >= d * 1.2:
-                        found.append((lg, P, stat, "demon", d, "MORE",
+                        found.append((lg, P, stat, "demon_value", d, "MORE",
                                       f"😈 Demon line {d:g}, but he went over it in {hit} of his last {len(vals)} games "
                                       f"(averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
     except Exception as e:
@@ -2390,20 +2421,32 @@ def error_scan(raw):
         print(f"LINE ERROR CHECK: line types on the board {types} | {len(found)} errors found | "
               f"channel {'set' if ERRORS_WEBHOOK_URL else 'NOT SET (log only)'}")
     sent = _state.setdefault("err_sent", {})
+    seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
+    keys_now = set()
+    for lg, P, stat, ot, line, direction, why in found:
+        keys_now.add(f"{lg}|{P['name']}|{stat}|{ot}|{line:g}")
+    for k in [k for k in seen if k not in keys_now]:
+        del seen[k]                                   # it went away (PrizePicks was just moving lines): never posted
     for lg, P, stat, ot, line, direction, why in found:
         k = f"{lg}|{P['name']}|{stat}|{ot}|{line:g}"
         if k in sent:
             continue
+        seen.setdefault(k, time.time())
+        if time.time() - seen[k] < ERR_CONFIRM_S:
+            continue
         sent[k] = time.time()
-        label = {"demon": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
-        title = f"🚨 LINE ERROR — {lg}: {P['name']} {stat.title()}{label} {direction} {line:g}"
+        label = {"demon": " 😈 DEMON", "demon_value": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
+        college = lg.startswith(("CFB", "CBB", "NCAA"))
+        kind_txt = "💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR"   # value = strong form, not a pricing mistake
+        title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {direction} {line:g}"
         print("LINE ERROR:", title, "|", why)
         if ERRORS_WEBHOOK_URL:
             embed = {"title": title, "description": why, "color": 15158332,
                      "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
                                  "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}", "inline": False}],
                      "footer": {"text": "Model v3.0 • alert only • PrizePicks can fix a mistake fast, so check it's still there"}}
-            _post({"content": f"🚨 **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n{PP_LINK_TXT}"[:1900],
+            _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n"
+                               + ("🎓 College: not available in every state\n" if college else "") + PP_LINK_TXT)[:1900],
                    "embeds": [embed]}, ERRORS_WEBHOOK_URL)
 
 
