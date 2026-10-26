@@ -2268,6 +2268,160 @@ def _err_norm_stat(t):
     return re.sub(r"\s+", " ", re.sub(r"[()]", " ", str(t or "").lower())).strip()
 
 
+LOCKS_WEBHOOK_URL = os.getenv("LOCKS_WEBHOOK_URL") or next(
+    (v.strip() for k, v in os.environ.items() if "LOCK" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
+LOCK_MIN_MINUTES = float(os.getenv("HB_LOCK_MIN_MINUTES", "24"))
+LOCK_MAX_PER_DAY = int(os.getenv("HB_LOCK_MAX_PER_DAY", "15"))
+
+
+LOCK_NFL_GAMES = 5          # an NFL season is short: 5+ games with his current team
+LOCK_NHL_TOI = 14.0          # NHL skaters: 14+ minutes a game (goalies: starts only)
+
+
+def _espn_teams(sport):
+    hit = _state.setdefault("espn_teams", {}).get(sport)
+    if hit and time.time() - hit[0] < 24 * 3600:
+        return hit[1]
+    out = {}
+    try:
+        for t in _get_json(ESPN[sport] + "/teams")["sports"][0]["leagues"][0]["teams"]:
+            tm = t.get("team") or {}
+            names = {tm.get("abbreviation", ""), tm.get("shortDisplayName", ""), tm.get("name", ""),
+                     tm.get("location", ""), tm.get("displayName", "")}
+            out[str(tm.get("id"))] = {"abbr": tm.get("abbreviation", ""), "name": tm.get("displayName", ""),
+                                      "keys": {re.sub(r"[^A-Z]", "", n.upper()) for n in names if n}}
+    except Exception as e:
+        print(f"{sport} teams error:", e)
+    if out:
+        _state["espn_teams"][sport] = (time.time(), out)
+    return out
+
+
+def _nfl_team_games(tid):
+    sc = _state.setdefault("nfl_sched", {})
+    hit = sc.get(tid)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    games, now = [], _now()
+    try:
+        d = _get_json(f"{ESPN['NFL']}/teams/{tid}/schedule")
+        for ev in d.get("events", []) or []:
+            dt = _to_dt(ev.get("date"))
+            comp = (ev.get("competitions") or [{}])[0]
+            if dt and (now - dt).total_seconds() > 5 * 3600 and \
+                    (((comp.get("status") or {}).get("type") or {}).get("completed")) is not False:
+                games.append((dt, str(ev.get("id"))))
+    except Exception as e:
+        print(f"NFL schedule error ({tid}):", e)
+        return hit[1] if hit else []
+    games.sort(reverse=True)
+    out = [eid for _, eid in games[:FORM_GAMES]]
+    sc[tid] = (time.time(), out)
+    return out
+
+
+def _nfl_game_box(eid):
+    cache = _state.setdefault("nfl_box", {})
+    if eid in cache:
+        return cache[eid]
+    if _state.get("lock_budget", 0) <= 0:
+        return None
+    _state["lock_budget"] -= 1
+    try:
+        res = box_score("NFL", eid)
+    except Exception:
+        return None
+    cache[eid] = res
+    return res
+
+
+def _lock_pick(vals, goblins):
+    ok = [g for g in set(goblins) if min(vals) >= g + max(1.0, 0.15 * g)]
+    return max(ok) if ok else None
+
+
+def _locks_nhl_nfl(rows):
+    _state["lock_budget"] = int(os.getenv("HB_LOCK_FETCH_PER_CYCLE", "6"))
+    out = []
+    nhl_ts = nfl_t = None
+    for (lg, norm, _g), P in rows.items():
+        if lg not in ("NHL", "NFL"):
+            continue
+        for stat, by in P["lines"].items():
+            if not by.get("goblin"):
+                continue
+            m = STAT_MAP.get(lg, {}).get(stat)
+            if not m or m[0] in ("saves_combo", "rr_yds", "pq_yds"):
+                continue
+            key = m[0]
+            if lg == "NHL":
+                nhl_ts = nhl_ts or nhl_team_stats()
+                tid = _nhl_team(nhl_ts, P["team"])
+                if key in ("nhl_g", "nhl_a", "nhl_pts"):
+                    continue                              # not in the NHL box parse
+                vals = _nhl_form_values(norm, tid, key) if tid else None
+                if not vals or len(vals) < 8:
+                    continue
+                if not _state.get("is_goalie", {}).get(norm):
+                    toi = _nhl_form_values(norm, tid, "toi") or []
+                    if not toi or sum(toi) / len(toi) < LOCK_NHL_TOI:
+                        continue
+                mn = None
+            else:
+                nfl_t = nfl_t or _espn_teams("NFL")
+                tid = _nba_team(nfl_t, P["team"]) if nfl_t else None
+                if not tid:
+                    continue
+                vals, ready = [], True
+                for eid in _nfl_team_games(tid):
+                    box = _nfl_game_box(eid)
+                    if box is None:
+                        ready = False
+                        break
+                    r = box.get(norm)
+                    if r and key in r:
+                        vals.append(r[key])
+                if not ready or len(vals) < LOCK_NFL_GAMES:
+                    continue
+                mn = None
+            g = _lock_pick(vals, by["goblin"])
+            if g is not None:
+                out.append((lg, P, stat, g, vals, mn))
+    return out
+
+
+def _post_locks(locks, sent):
+    """🔒 LOCK LEGS: posted once each, at most LOCK_MAX_PER_DAY a day, safest first. Only with LOCKS_WEBHOOK_URL."""
+    if not locks:
+        return
+    day = _now().astimezone(_ET).strftime("%Y-%m-%d") if _ET is not timezone.utc else _now().strftime("%Y-%m-%d")
+    n_today = sum(1 for k in sent if k.startswith(f"LOCK|{day}|"))
+    locks.sort(key=lambda x: -(min(x[4]) - x[3]) / max(x[3], 1))      # biggest cushion first
+    for lg, P, stat, g, vals, mn in locks:
+        k = f"LOCK|{day}|{lg}|{P['name']}|{stat}|{g:g}"
+        if k in sent or any(x.startswith(f"LOCK|{day}|{lg}|{P['name']}|{stat}|") for x in sent):
+            continue
+        if n_today >= LOCK_MAX_PER_DAY:
+            break
+        sent[k] = time.time()
+        n_today += 1
+        why = (f"👺 Goblin {g:g}: he cleared it in ALL of his last {len(vals)} games (lowest {min(vals):g}, "
+               f"averaging {sum(vals) / len(vals):.1f}{f', {mn:.0f} minutes a game' if mn else ''}). Last {len(vals)}: "
+               + ", ".join(f"{v:g}" for v in vals))
+        print(f"LOCK LEG: {P['name']} {stat} goblin {g:g} | {why}")
+        if LOCKS_WEBHOOK_URL:
+            embed = {"title": f"🔒 LOCK LEG — {lg}: {P['name']} {stat.title()} 👺 MORE {g:g}", "description": why,
+                     "color": 3066993,
+                     "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
+                                 "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}",
+                                 "inline": False}],
+                     "footer": {"text": "Model v3.0 • alert only • safe but LOW-PAYING: a goblin lowers your payout. "
+                                        "Check he's playing before you lock"}}
+            _post({"content": f"🔒 **{P['name']} — {stat.title()} 👺 GOBLIN MORE {g:g}**\n{PP_LINK_TXT}"[:1900],
+                   "embeds": [embed]}, LOCKS_WEBHOOK_URL)
+
+
 def error_scan(raw):
     players, leagues, games = {}, {}, {}
     for inc in raw.get("included", []) or []:
@@ -2319,16 +2473,17 @@ def error_scan(raw):
         L = P["lines"]
         for stat, by in L.items():
             std = by.get("standard")
-            if std and len(set(std)) > 1:
-                continue                                  # v3.0: two different regular lines at once = PrizePicks mid-move
-            # 1) demon at or below the standard line
+            mid_move = bool(std) and len(set(std)) > 1      # two different regular lines at once = PrizePicks mid-move
+            # 1) demon at or below the standard line (while mid-move: only if it's far below EVERY regular line)
             if std and by.get("demon"):
                 s0 = min(std)
                 for d in sorted(set(by["demon"])):
-                    if d <= s0:
+                    if d <= s0 and (not mid_move or d <= 0.75 * s0):
                         found.append((lg, P, stat, "demon", d, "MORE",
                                       f"😈 Demon line {d:g} is at or below his standard line {s0:g}. A demon should be harder "
                                       f"than the standard line, so this is a PrizePicks mistake: take the DEMON More"))
+            if mid_move:
+                continue
             # 1c) a GOBLIN at or above the regular line: then the REGULAR line is the easier one and pays more
             if std and by.get("goblin"):
                 s0 = max(std)
@@ -2366,12 +2521,19 @@ def error_scan(raw):
                 c0 = min(std)
                 for pn in part_names:
                     ps = (L.get(pn) or {}).get("standard")
+                    if yards:
+                        # yards can go NEGATIVE (QB kneel-downs, sacks on scrambles), so a yards combo is only a
+                        # mistake if it's strictly below the part AND every other part is clearly positive (line 10+)
+                        others = [(L.get(o) or {}).get("standard") for o in part_names if o != pn]
+                        if not ps or not others or not all(o and min(o) >= 10 for o in others) or not c0 < max(ps):
+                            continue
                     if ps and c0 <= max(ps) <= c0 * 1.5:
                         found.append((lg, P, stat, "standard", c0, "MORE",
                                       f"{stat.title()} line {c0:g} is at or below his {pn.title()} line {max(ps):g} on its own. "
                                       f"The combo always counts at least that much, so this is a PrizePicks mistake: take the combo More"))
                         break
     # 3) NBA demon lines his last 10 games clear easily (box scores already loaded for the NBA form check)
+    locks = []
     try:
         teams = nba_teams() if any(k[0] == "NBA" for k in rows) else {}
         for (lg, norm, _g), P in rows.items():
@@ -2381,19 +2543,27 @@ def error_scan(raw):
             if not tid:
                 continue
             for stat, by in P["lines"].items():
-                if not by.get("demon") and not by.get("standard"):
+                if not by.get("demon") and not by.get("standard") and not by.get("goblin"):
                     continue
                 cl = classify_nba(stat)
                 if not cl or cl[1]:
                     continue
-                vals = []
+                vals, mins = [], []
                 for eid, _al in _nba_team_games(tid):
                     box = _state.get("nba_box", {}).get(eid)
                     if box and box.get(norm):
                         vals.append(box[norm][cl[0]])
+                        mins.append(box[norm].get("minutes", 0))
                 if len(vals) < 8:                       # v3.0: 8+ games, or it's too thin to call a mistake
                     continue
                 avg = sum(vals) / len(vals)
+                # v3.0 🔒 LOCK LEG: the HIGHEST goblin he cleared in EVERY one of his last 8-10 games, with room to spare,
+                # and he plays real minutes. Safe but low-paying -> its own channel.
+                if by.get("goblin") and sum(mins) / len(mins) >= LOCK_MIN_MINUTES:
+                    ok = [g for g in set(by["goblin"]) if min(vals) >= g + max(1.0, 0.15 * g)]
+                    if ok:
+                        g = max(ok)
+                        locks.append((lg, P, stat, g, vals, sum(mins) / len(mins)))
                 # v3.0: a REGULAR line way off his recent games (90%+ of 8+ games on one side, average 30% away)
                 for sl in sorted(set(by.get("standard") or [])):
                     if sl < 3:
@@ -2416,11 +2586,16 @@ def error_scan(raw):
                                       f"(averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
     except Exception as e:
         print("error scan (NBA form) error:", e)
+    try:
+        locks += _locks_nhl_nfl(rows)                # v3.0: lock legs for NHL and NFL too
+    except Exception as e:
+        print("lock legs (NHL/NFL) error:", e)
     if time.time() - _state.get("err_log_t", 0) > 3600:
         _state["err_log_t"] = time.time()
         print(f"LINE ERROR CHECK: line types on the board {types} | {len(found)} errors found | "
               f"channel {'set' if ERRORS_WEBHOOK_URL else 'NOT SET (log only)'}")
     sent = _state.setdefault("err_sent", {})
+    _post_locks(locks, sent)
     seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
     keys_now = set()
     for lg, P, stat, ot, line, direction, why in found:
@@ -2448,6 +2623,54 @@ def error_scan(raw):
             _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n"
                                + ("🎓 College: not available in every state\n" if college else "") + PP_LINK_TXT)[:1900],
                    "embeds": [embed]}, ERRORS_WEBHOOK_URL)
+
+
+# ====================== OTHER APPS: REACHABILITY TEST (v3.0, log only) ======================
+# Once an hour: can Railway read Underdog's, Sleeper's, Betr's and ParlayPlay's public boards? Only writes one log line each; posts nothing.
+PROBE_ON = os.getenv("HB_PROBE_APPS", "true").lower() == "true"
+PROBE_URLS = {
+    "UNDERDOG": ["https://api.underdogfantasy.com/v1/over_under_lines",
+                 "https://api.underdogfantasy.com/beta/v5/over_under_lines"],
+    "SLEEPER": ["https://api.sleeper.app/lines/available?dynamic=true&include_preseason=true",
+                "https://api.sleeper.app/lines/available"],
+    "BETR": ["POST https://api.fantasy.betr.app/graphql"],          # their hidden feed (GraphQL); a tiny test query
+    "PARLAYPLAY": ["https://parlayplay.io/api/v1/crossgame/search/?sport=All&league=&includeAlt=true",
+                   "https://parlayplay.io/api/v1/crossgame/search/?sport=NBA&league=NBA"],   # guessed addresses
+}
+
+
+def probe_apps():
+    if time.time() - _state.get("probe_t", 0) < 3600:
+        return
+    _state["probe_t"] = time.time()
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                         "Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "application/json"}
+    for app, urls in PROBE_URLS.items():
+        res = []
+        for u in urls:
+            try:
+                if u.startswith("POST "):
+                    r = requests.post(u[5:], json={"query": "{ __typename }"},
+                                      headers=dict(hdr, **{"Content-Type": "application/json"}), timeout=15)
+                else:
+                    r = requests.get(u, headers=hdr, timeout=15)
+                txt = r.text or ""
+                kind = "JSON" if txt[:1] in "{[" else ("CLOUDFLARE BLOCK" if "cloudflare" in txt.lower() or "cf-" in txt[:3000].lower()
+                                                     else "HTML/other")
+                n = ""
+                if kind == "JSON":
+                    try:
+                        d = r.json()
+                        if isinstance(d, dict):
+                            n = " | " + ", ".join(f"{k}: {len(v)}" for k, v in d.items() if isinstance(v, list))[:200]
+                        elif isinstance(d, list):
+                            n = f" | {len(d)} rows"
+                    except Exception:
+                        pass
+                res.append(f"{r.status_code} {kind} {len(txt) // 1024}KB{n}")
+            except Exception as e:
+                res.append(f"failed ({type(e).__name__})")
+        print(f"APP TEST {app}: " + " || ".join(res))
 
 
 # ====================== NBA PREGAME RECENT FORM (v2.7) ======================
@@ -3102,6 +3325,7 @@ def discovery_report(board, live):
                                        "the PREGAME channel (no ESPORTS_WEBHOOK_URL found)"))
     lines.append("Line errors → " + ("their own ERRORS channel" if ERRORS_WEBHOOK_URL else
                                      "log only (no ERRORS_WEBHOOK_URL found)"))
+    lines.append("Lock legs → " + ("their own LOCKS channel" if LOCKS_WEBHOOK_URL else "log only (no LOCKS_WEBHOOK_URL found)"))
     lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
     lines.append(f"NBA half-game lines I can model: {nba_half}")
@@ -3347,6 +3571,11 @@ def cycle(first=False):
             print("nba gate error:", e)
             pre_fresh = [c for c in pre_fresh if (c[3].get("sport") or c[1].get("sport")) != "NBA"]
     fresh += pre_fresh
+    if PROBE_ON:
+        try:
+            probe_apps()                            # v3.0: log-only test of Underdog / Sleeper
+        except Exception as e:
+            print("app test error:", e)
     if ERR_ON:
         try:
             error_scan(raw)                         # v3.0: pricing mistakes -> their own quiet channel
