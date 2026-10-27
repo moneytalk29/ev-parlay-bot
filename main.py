@@ -2249,7 +2249,7 @@ def cs2_form_pregame(singles):
 # Posts ONLY when PrizePicks' own lines contradict each other (a pricing mistake), so the channel stays quiet:
 #   1) a 😈 DEMON line that is at or BELOW the same player's standard line (a demon is supposed to be harder)
 #   2) a combo line (PRA, Pts+Rebs, Rush+Rec Yds, Kills combos...) at or BELOW one of its own parts' lines
-#   3) NBA: a demon line his recent games clear easily (8+ of his last 10, average well above it)
+#   (form-based "value" checks were removed: only lines that contradict each other count as errors)
 # Needs ERRORS_WEBHOOK_URL (any variable name with ERROR + WEBHOOK). Without it, errors are only written to the log.
 ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
     (v.strip() for k, v in os.environ.items() if "ERROR" in k.upper() and "WEBHOOK" in k.upper()
@@ -2268,6 +2268,9 @@ def _err_norm_stat(t):
     return re.sub(r"\s+", " ", re.sub(r"[()]", " ", str(t or "").lower())).strip()
 
 
+DEMONS_WEBHOOK_URL = os.getenv("DEMONS_WEBHOOK_URL") or next(   # v3.0: 💎 DEMON VALUE plays (not errors)
+    (v.strip() for k, v in os.environ.items() if "DEMON" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
 LOCKS_WEBHOOK_URL = os.getenv("LOCKS_WEBHOOK_URL") or next(
     (v.strip() for k, v in os.environ.items() if "LOCK" in k.upper() and "WEBHOOK" in k.upper()
      and v.strip().startswith("http")), None)
@@ -2532,7 +2535,7 @@ def error_scan(raw):
                                       f"{stat.title()} line {c0:g} is at or below his {pn.title()} line {max(ps):g} on its own. "
                                       f"The combo always counts at least that much, so this is a PrizePicks mistake: take the combo More"))
                         break
-    # 3) NBA demon lines his last 10 games clear easily (box scores already loaded for the NBA form check)
+    # NBA lock legs (box scores already loaded for the NBA form check)
     locks = []
     try:
         teams = nba_teams() if any(k[0] == "NBA" for k in rows) else {}
@@ -2564,26 +2567,8 @@ def error_scan(raw):
                     if ok:
                         g = max(ok)
                         locks.append((lg, P, stat, g, vals, sum(mins) / len(mins)))
-                # v3.0: a REGULAR line way off his recent games (90%+ of 8+ games on one side, average 30% away)
-                for sl in sorted(set(by.get("standard") or [])):
-                    if sl < 3:
-                        continue
-                    over = sum(1 for v in vals if v > sl)
-                    under = sum(1 for v in vals if v < sl)
-                    if over / len(vals) >= 0.9 and avg >= sl * 1.3:
-                        found.append((lg, P, stat, "standard", sl, "MORE",
-                                      f"Regular line {sl:g} is way under his recent games: over it in {over} of his last "
-                                      f"{len(vals)} (averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
-                    elif under / len(vals) >= 0.9 and avg <= sl * 0.7:
-                        found.append((lg, P, stat, "standard", sl, "LESS",
-                                      f"Regular line {sl:g} is way over his recent games: under it in {under} of his last "
-                                      f"{len(vals)} (averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
-                for d in sorted(set(by.get("demon") or [])):
-                    hit = sum(1 for v in vals if v > d)
-                    if hit / len(vals) >= 0.8 and avg >= d * 1.2:
-                        found.append((lg, P, stat, "demon_value", d, "MORE",
-                                      f"😈 Demon line {d:g}, but he went over it in {hit} of his last {len(vals)} games "
-                                      f"(averaging {avg:.1f}). Last {len(vals)}: " + ", ".join(f"{v:g}" for v in vals)))
+                # v3.0: form-based "value" checks removed: the error channel is ONLY for clear pricing mistakes
+                # (lines that contradict each other). Lock legs below still use his recent games.
     except Exception as e:
         print("error scan (NBA form) error:", e)
     try:
@@ -2615,14 +2600,15 @@ def error_scan(raw):
         kind_txt = "💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR"   # value = strong form, not a pricing mistake
         title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {direction} {line:g}"
         print("LINE ERROR:", title, "|", why)
-        if ERRORS_WEBHOOK_URL:
-            embed = {"title": title, "description": why, "color": 15158332,
+        dest = ERRORS_WEBHOOK_URL
+        if dest:
+            embed = {"title": title, "description": why, "color": 10181046 if ot == "demon_value" else 15158332,
                      "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
                                  "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}", "inline": False}],
                      "footer": {"text": "Model v3.0 • alert only • PrizePicks can fix a mistake fast, so check it's still there"}}
             _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n"
                                + ("🎓 College: not available in every state\n" if college else "") + PP_LINK_TXT)[:1900],
-                   "embeds": [embed]}, ERRORS_WEBHOOK_URL)
+                   "embeds": [embed]}, dest)
 
 
 # ====================== OTHER APPS: REACHABILITY TEST (v3.0, log only) ======================
