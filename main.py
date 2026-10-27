@@ -2255,6 +2255,8 @@ ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
     (v.strip() for k, v in os.environ.items() if "ERROR" in k.upper() and "WEBHOOK" in k.upper()
      and v.strip().startswith("http")), None)
 ERR_ON = os.getenv("HB_ERRORS", "true").lower() == "true"
+ERR_ONLY_DEMONS = os.getenv("HB_ERRORS_ONLY_DEMONS", "true").lower() == "true"   # v3.0: only Pickens-type errors
+ERR_DEMON_GAP = float(os.getenv("HB_ERRORS_DEMON_GAP", "0.85"))  # demon must be 15%+ below the regular line (34.5 vs 64)
 ERR_CONFIRM_S = float(os.getenv("HB_ERRORS_CONFIRM_SECONDS", "180"))   # must still be on the board 3 minutes later
 # v3.0: leagues to leave out of the error check (college props aren't allowed in every state). Comma list, PrizePicks names.
 ERR_SKIP = {x.strip().upper() for x in os.getenv("HB_ERRORS_SKIP_LEAGUES", "").split(",") if x.strip()}
@@ -2481,10 +2483,9 @@ def error_scan(raw):
             if std and by.get("demon"):
                 s0 = min(std)
                 for d in sorted(set(by["demon"])):
-                    if d <= s0 and (not mid_move or d <= 0.75 * s0):
+                    if d <= ERR_DEMON_GAP * s0 and (not mid_move or d <= 0.75 * s0):
                         found.append((lg, P, stat, "demon", d, "MORE",
-                                      f"😈 Demon line {d:g} is at or below his standard line {s0:g}. A demon should be harder "
-                                      f"than the standard line, so this is a PrizePicks mistake: take the DEMON More"))
+                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}\n➡️ Take the DEMON More: it's easier AND pays more"))
             if mid_move:
                 continue
             # 1c) a GOBLIN at or above the regular line: then the REGULAR line is the easier one and pays more
@@ -2581,6 +2582,8 @@ def error_scan(raw):
               f"channel {'set' if ERRORS_WEBHOOK_URL else 'NOT SET (log only)'}")
     sent = _state.setdefault("err_sent", {})
     _post_locks(locks, sent)
+    if ERR_ONLY_DEMONS:                               # v3.0: only Pickens-type errors (a demon clearly below the regular line)
+        found = [x for x in found if x[3] == "demon"]
     seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
     keys_now = set()
     for lg, P, stat, ot, line, direction, why in found:
