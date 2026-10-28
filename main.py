@@ -2276,12 +2276,15 @@ DEMONS_WEBHOOK_URL = os.getenv("DEMONS_WEBHOOK_URL") or next(   # v3.0: 💎 DEM
 LOCKS_WEBHOOK_URL = os.getenv("LOCKS_WEBHOOK_URL") or next(
     (v.strip() for k, v in os.environ.items() if "LOCK" in k.upper() and "WEBHOOK" in k.upper()
      and v.strip().startswith("http")), None)
-LOCK_MIN_MINUTES = float(os.getenv("HB_LOCK_MIN_MINUTES", "24"))
+LOCK_MIN_MINUTES = float(os.getenv("HB_LOCK_MIN_MINUTES", "26"))   # v3.0: real rotation minutes (26+)
 LOCK_MAX_PER_DAY = int(os.getenv("HB_LOCK_MAX_PER_DAY", "15"))
 
 
 LOCK_NFL_GAMES = 5          # an NFL season is short: 5+ games with his current team
-LOCK_NHL_TOI = 14.0          # NHL skaters: 14+ minutes a game (goalies: starts only)
+LOCK_NHL_TOI = 17.0          # NHL skaters: 17+ minutes a game, top-line/top-pair only (goalies: starts only)
+LOCK_NFL_VOLUME = {"rush_yds": ("rush_att", 12), "rush_att": ("rush_att", 12),      # RBs: 12+ carries a game
+                   "rec_yds": ("rec_cnt", 4), "rec_cnt": ("rec_cnt", 4),            # WR/TE: 4+ catches a game
+                   "pass_yds": ("pass_att", 25), "pass_att": ("pass_att", 25), "pass_cmp": ("pass_att", 25)}
 
 
 def _espn_teams(sport):
@@ -2378,7 +2381,8 @@ def _locks_nhl_nfl(rows):
                 tid = _nba_team(nfl_t, P["team"]) if nfl_t else None
                 if not tid:
                     continue
-                vals, ready = [], True
+                vals, vol, ready = [], [], True
+                need = LOCK_NFL_VOLUME.get(key)
                 for eid in _nfl_team_games(tid):
                     box = _nfl_game_box(eid)
                     if box is None:
@@ -2387,8 +2391,11 @@ def _locks_nhl_nfl(rows):
                     r = box.get(norm)
                     if r and key in r:
                         vals.append(r[key])
-                if not ready or len(vals) < LOCK_NFL_GAMES:
+                        vol.append(r.get(need[0], 0) if need else 0)
+                if not ready or len(vals) < LOCK_NFL_GAMES or not need:
                     continue
+                if sum(vol) / len(vol) < need[1]:
+                    continue                              # v3.0: heavy usage only (lead back, main target, starting QB)
                 mn = None
             g = _lock_pick(vals, by["goblin"])
             if g is not None:
@@ -2616,6 +2623,201 @@ def error_scan(raw):
                    "embeds": [embed]}, dest)
 
 
+# ====================== CROSS-APP: PRIZEPICKS vs UNDERDOG (v3.0) ======================
+# Same player, same stat, same game, regular lines only. Fantasy score is left out (each app scores it differently).
+#   🚨 ERROR (→ #error): one app's line is 25%+ below the other's (like Harden assists 3.5 vs 8.5)
+#   💰 VALUE (→ #value, VALUE_WEBHOOK_URL): the lower line is at least 1 full point AND 10% below the other
+XAPP_ON = os.getenv("HB_CROSS_APP", "true").lower() == "true"
+XAPP_EVERY = float(os.getenv("HB_CROSS_APP_SECONDS", "300"))       # Underdog's board is big: read it every 5 minutes
+XAPP_ERR_GAP = float(os.getenv("HB_CROSS_APP_ERROR_GAP", "0.25"))
+XAPP_VAL_GAP = float(os.getenv("HB_CROSS_APP_VALUE_GAP", "0.10"))
+XAPP_VAL_MIN = float(os.getenv("HB_CROSS_APP_VALUE_POINTS", "1.0"))
+XAPP_VAL_PER_DAY = int(os.getenv("HB_CROSS_APP_VALUE_PER_DAY", "20"))
+VALUE_WEBHOOK_URL = os.getenv("VALUE_WEBHOOK_URL") or next(
+    (v.strip() for k, v in os.environ.items() if "VALUE" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
+_XSTAT = [  # (canonical key, words that identify it) - checked in order, most specific first
+    ("pra", ("ptsrebsasts", "pointsreboundsassists", "pra")), ("pr", ("ptsrebs", "pointsrebounds")),
+    ("pa", ("ptsasts", "pointsassists")), ("ra", ("rebsasts", "reboundsassists")),
+    ("3pm", ("3pointersmade", "3ptmade", "3pm", "threepointersmade", "threesmade")),
+    ("rushrec", ("rushrecyds", "rushrecyards", "rushingreceivingyards", "rushandrecyards")),
+    ("passrush", ("passrushyds", "passrushyards", "passingrushingyards")),
+    ("passyds", ("passyards", "passingyards", "passyds")), ("rushyds", ("rushyards", "rushingyards", "rushyds")),
+    ("recyds", ("receivingyards", "recyards", "recyds")), ("rec", ("receptions",)),
+    ("passatt", ("passattempts", "passingattempts")), ("passcmp", ("passcompletions", "completions")),
+    ("rushatt", ("rushattempts", "rushingattempts", "carries")),
+    ("sog", ("shotsongoal", "sog")), ("saves", ("goaliesaves", "saves")), ("hits", ("hits",)),
+    ("blk", ("blockedshots", "blocks")), ("stl", ("steals",)), ("tov", ("turnovers",)),
+    ("pts", ("points",)), ("reb", ("rebounds",)), ("ast", ("assists",)),
+]
+
+
+def _xstat(name):
+    t = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if not t or "fantasy" in t or "combo" in t or re.search(r"(1h|2h|1q|2q|3q|4q|1sthalf|quarter|period|inning|set)", t):
+        return None
+    for key, words in _XSTAT:
+        if any(t == w or t.startswith(w) for w in words):
+            return key
+    return None
+
+
+def _pp_regular_index(raw):
+    """{(SPORT, player, stat key): (line, start)} for PrizePicks' REGULAR pregame lines (no demons/goblins)."""
+    players, leagues = {}, {}
+    for inc in raw.get("included", []) or []:
+        a = inc.get("attributes", {}) or {}
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = a.get("name", "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    out, now = {}, _now()
+    for item in raw.get("data", []) or []:
+        try:
+            if item.get("_live_feed"):
+                continue
+            a, rel = item["attributes"], item.get("relationships", {})
+            if str(a.get("odds_type") or "standard").lower() != "standard" or str(a.get("is_promo")).lower() == "true":
+                continue
+            st = _to_dt(a.get("start_time"))
+            if not st or st <= now:
+                continue
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            nm = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
+            k = _xstat(a.get("stat_display_name") or a.get("stat_type"))
+            line = _num(a.get("line_score"))
+            if lg and nm and k and line > 0 and " + " not in nm:
+                out[(lg, _norm(nm), k)] = (line, st, nm, a.get("description") or "")
+        except Exception:
+            continue
+    return out
+
+
+def _ud_index():
+    """{(SPORT, player, stat key): (line, start, name, higher x, lower x)} from Underdog's public board."""
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                         "Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "application/json"}
+    r = requests.get("https://api.underdogfantasy.com/v1/over_under_lines", headers=hdr, timeout=30)
+    if r.status_code != 200:
+        print(f"CROSS-APP: Underdog said {r.status_code}")
+        return None
+    d = r.json()
+    del r
+    players = {p.get("id"): p for p in d.get("players", []) or []}
+    apps = {a.get("id"): a for a in d.get("appearances", []) or []}
+    games = {}
+    for g in (d.get("games", []) or []) + (d.get("solo_games", []) or []):
+        games[g.get("id")] = g
+    out, now = {}, _now()
+    for ln in d.get("over_under_lines", []) or []:
+        try:
+            if str(ln.get("status") or "active").lower() != "active":
+                continue
+            ou = ln.get("over_under") or {}
+            ast = ou.get("appearance_stat") or {}
+            k = _xstat(ast.get("display_stat") or ast.get("stat"))
+            if not k:
+                continue
+            app = apps.get(ast.get("appearance_id")) or {}
+            pl = players.get(app.get("player_id")) or {}
+            nm = f"{pl.get('first_name', '')} {pl.get('last_name', '')}".strip()
+            sport = str(pl.get("sport_id") or "").upper()
+            g = games.get(app.get("match_id")) or {}
+            st = _to_dt(g.get("scheduled_at") or g.get("starts_at"))
+            if not nm or not sport or (st and st <= now):
+                continue
+            mult = {str(o.get("choice") or "").lower(): _num(o.get("payout_multiplier"), 0) for o in ln.get("options", []) or []}
+            if "higher" not in mult or "lower" not in mult:
+                continue                                  # one-sided (boosted / special) lines are skipped
+            line = _num(ln.get("stat_value"))
+            if line > 0:
+                out[(sport, _norm(nm), k)] = (line, st, nm, mult["higher"], mult["lower"])
+        except Exception:
+            continue
+    del d
+    gc.collect()
+    return out
+
+
+def cross_app_scan(raw):
+    if time.time() - _state.get("xapp_t", 0) < XAPP_EVERY:
+        return
+    _state["xapp_t"] = time.time()
+    pp = _pp_regular_index(raw)
+    ud = _ud_index()
+    if ud is None:
+        return
+    errs, vals = [], []
+    for key, u in ud.items():
+        p = pp.get(key)
+        if not p:
+            continue
+        if p[1] and u[1] and abs((p[1] - u[1]).total_seconds()) > 3 * 3600:
+            continue                                      # different games
+        lo_app, lo, hi_app, hi = ("UNDERDOG", u[0], "PRIZEPICKS", p[0]) if u[0] < p[0] else ("PRIZEPICKS", p[0], "UNDERDOG", u[0])
+        if hi <= 0 or lo == hi:
+            continue
+        gap = (hi - lo) / hi
+        row = (key, p, u, lo_app, lo, hi_app, hi, gap)
+        if gap >= XAPP_ERR_GAP:
+            errs.append(row)
+        elif gap >= XAPP_VAL_GAP and hi - lo >= XAPP_VAL_MIN:
+            vals.append(row)
+    if time.time() - _state.get("xapp_log_t", 0) > 3600:
+        _state["xapp_log_t"] = time.time()
+        both = sum(1 for k in ud if k in pp)
+        print(f"CROSS-APP CHECK: PrizePicks {len(pp)} regular lines, Underdog {len(ud)} | {both} on both apps | "
+              f"{len(errs)} errors, {len(vals)} value | value channel {'set' if VALUE_WEBHOOK_URL else 'NOT SET (log only)'}")
+    sent = _state.setdefault("err_sent", {})
+    pend = _state.setdefault("xapp_pend", {})
+    now_keys = {f"X|{r[0]}|{r[4]:g}" for r in errs}
+    for k in [k for k in pend if k not in now_keys]:
+        del pend[k]
+    for key, p, u, lo_app, lo, hi_app, hi, gap in sorted(errs, key=lambda r: -r[7]):
+        k = f"X|{key}|{lo:g}"
+        if k in sent:
+            continue
+        if k not in pend:                                 # must still be there on the next read (5 min) to post
+            pend[k] = time.time()
+            continue
+        sent[k] = time.time()
+        _xpost("error", key, p, u, lo_app, lo, hi_app, hi, gap)
+    day = _now().strftime("%Y-%m-%d")
+    n_today = sum(1 for k in sent if k.startswith(f"V|{day}|"))
+    for key, p, u, lo_app, lo, hi_app, hi, gap in sorted(vals, key=lambda r: -r[7]):
+        if n_today >= XAPP_VAL_PER_DAY:
+            break
+        k = f"V|{day}|{key}|{lo:g}"
+        if k in sent:
+            continue
+        sent[k] = time.time()
+        n_today += 1
+        _xpost("value", key, p, u, lo_app, lo, hi_app, hi, gap)
+
+
+def _xpost(kind, key, p, u, lo_app, lo, hi_app, hi, gap):
+    sport, _n, k = key
+    stat = next((w[0] for kk, w in _XSTAT if kk == k), k).replace("pts", "Pts ").title()
+    stat = {"pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
+            "rushrec": "Rush+Rec Yards", "passrush": "Pass+Rush Yards", "passyds": "Pass Yards", "rushyds": "Rush Yards",
+            "recyds": "Receiving Yards", "rec": "Receptions", "passatt": "Pass Attempts", "passcmp": "Completions",
+            "rushatt": "Rush Attempts", "sog": "Shots On Goal", "saves": "Saves", "hits": "Hits", "blk": "Blocks",
+            "stl": "Steals", "tov": "Turnovers", "pts": "Points", "reb": "Rebounds", "ast": "Assists"}.get(k, stat)
+    name = p[2] or u[2]
+    icon, dest = ("🚨", ERRORS_WEBHOOK_URL) if kind == "error" else ("💰", VALUE_WEBHOOK_URL)
+    ud_txt = f"Underdog: {u[0]:g} (Higher {u[3]:g}x / Lower {u[4]:g}x)"
+    body = f"{'PrizePicks: ' + format(p[0], 'g')}\n{ud_txt}\n{lo_app.title()} is {gap:.0%} lower"
+    print(f"CROSS-APP {kind.upper()}: [{lo_app}] {name} {stat} {lo:g} | {body.replace(chr(10), ' | ')}")
+    if not dest:
+        return
+    title = f"{icon} [{lo_app}] {name} — {stat} {lo:g}"
+    embed = {"title": title, "description": body, "color": 15158332 if kind == "error" else 15844367,
+             "fields": [{"name": f"{name} ({sport})", "value": f"{p[3] and 'vs ' + p[3] + ' • '}starts {_start_txt(p[1])}",
+                         "inline": False}],
+             "footer": {"text": "Model v3.0 • alert only • lines move fast, check it's still there"}}
+    _post({"content": f"{icon} **[{lo_app}] {name} — {stat} {lo:g}**"[:1900], "embeds": [embed]}, dest)
+
+
 # ====================== OTHER APPS: REACHABILITY TEST (v3.0, log only) ======================
 # Once an hour: can Railway read Underdog, Sleeper, Betr, ParlayPlay, Kalshi and Polymarket? Only writes one log line each; posts nothing.
 PROBE_ON = os.getenv("HB_PROBE_APPS", "true").lower() == "true"
@@ -2688,6 +2890,8 @@ def sample_apps(hdr):
         print("APP SAMPLE UNDERDOG appearance:", json.dumps((d.get("appearances") or [{}])[0])[:400])
         print("APP SAMPLE UNDERDOG player:", json.dumps((d.get("players") or [{}])[0])[:400])
         print("APP SAMPLE UNDERDOG game:", json.dumps((d.get("games") or [{}])[0])[:400])
+        print("APP KEYS UNDERDOG line:", sorted(ln.keys()), "| over_under:", sorted((ln.get("over_under") or {}).keys()),
+              "| option:", {k: v for k, v in ((ln.get("options") or [{}])[0]).items() if not isinstance(v, (dict, list))})
     except Exception as e:
         print("APP SAMPLE UNDERDOG failed:", e)
     try:
@@ -2695,6 +2899,10 @@ def sample_apps(hdr):
                          headers=hdr, timeout=20).json()
         rows = d if isinstance(d, list) else next((v for v in d.values() if isinstance(v, list)), [])
         print("APP SAMPLE SLEEPER row:", json.dumps(rows[0] if rows else d)[:1200])
+        r0 = rows[0] if rows else {}
+        o0 = (r0.get("options") or [{}])[0] if isinstance(r0, dict) else {}
+        print("APP KEYS SLEEPER row:", sorted(r0.keys()) if isinstance(r0, dict) else type(r0).__name__)
+        print("APP KEYS SLEEPER option:", {k: v for k, v in o0.items() if not isinstance(v, (dict, list))})
     except Exception as e:
         print("APP SAMPLE SLEEPER failed:", e)
 
@@ -3419,6 +3627,7 @@ def discovery_report(board, live):
                                        "the PREGAME channel (no ESPORTS_WEBHOOK_URL found)"))
     lines.append("Line errors → " + ("their own ERRORS channel" if ERRORS_WEBHOOK_URL else
                                      "log only (no ERRORS_WEBHOOK_URL found)"))
+    lines.append("Cross-app value → " + ("their own VALUE channel" if VALUE_WEBHOOK_URL else "log only (no VALUE_WEBHOOK_URL found)"))
     lines.append("Lock legs → " + ("their own LOCKS channel" if LOCKS_WEBHOOK_URL else "log only (no LOCKS_WEBHOOK_URL found)"))
     lines.append("Tennis discovery: " + ("ON (logging only)" if TENNIS_DISCOVERY else "off"))
     nba_half = sum(1 for k in board if k[0] == "NBA" and k[3])
@@ -3670,6 +3879,11 @@ def cycle(first=False):
             probe_apps()                            # v3.0: log-only test of Underdog / Sleeper
         except Exception as e:
             print("app test error:", e)
+    if XAPP_ON:
+        try:
+            cross_app_scan(raw)                     # v3.0: PrizePicks vs Underdog: errors -> #error, value -> #value
+        except Exception as e:
+            print("cross-app error:", e)
     if ERR_ON:
         try:
             error_scan(raw)                         # v3.0: pricing mistakes -> their own quiet channel
