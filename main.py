@@ -2615,7 +2615,7 @@ def error_scan(raw):
 
 
 # ====================== OTHER APPS: REACHABILITY TEST (v3.0, log only) ======================
-# Once an hour: can Railway read Underdog's, Sleeper's, Betr's and ParlayPlay's public boards? Only writes one log line each; posts nothing.
+# Once an hour: can Railway read Underdog, Sleeper, Betr, ParlayPlay, Kalshi and Polymarket? Only writes one log line each; posts nothing.
 PROBE_ON = os.getenv("HB_PROBE_APPS", "true").lower() == "true"
 PROBE_URLS = {
     "UNDERDOG": ["https://api.underdogfantasy.com/v1/over_under_lines",
@@ -2625,6 +2625,10 @@ PROBE_URLS = {
     "BETR": ["POST https://api.fantasy.betr.app/graphql"],          # their hidden feed (GraphQL); a tiny test query
     "PARLAYPLAY": ["https://parlayplay.io/api/v1/crossgame/search/?sport=All&league=&includeAlt=true",
                    "https://parlayplay.io/api/v1/crossgame/search/?sport=NBA&league=NBA"],   # guessed addresses
+    "KALSHI": ["https://external-api.kalshi.com/trade-api/v2/markets?status=open&limit=100",       # official, no key
+               "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&limit=100"],
+    "POLYMARKET": ["https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100",  # public, no key
+                   "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=50&tag_slug=sports"],
 }
 
 
