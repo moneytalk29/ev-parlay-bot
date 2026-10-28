@@ -2493,9 +2493,8 @@ def error_scan(raw):
                 s0 = max(std)
                 g = max(by["goblin"])
                 if g >= s0:
-                    found.append((lg, P, stat, "standard", s0, "MORE",
-                                  f"👺 Goblin line {g:g} is at or above his regular line {s0:g}. A goblin should be easier "
-                                  f"than the regular line, so the regular {s0:g} is the mistake: take the regular More"))
+                    found.append((lg, P, stat, "regular", s0, "MORE",
+                                  f"Normal line: {s0:g}\n👺 Goblin: {g:g}", g))
             # 1b) a promo / flash-sale line far below the standard line (PrizePicks discount: worth knowing)
             if std and by.get("promo"):
                 s0 = min(std)
@@ -2583,7 +2582,10 @@ def error_scan(raw):
     sent = _state.setdefault("err_sent", {})
     _post_locks(locks, sent)
     if ERR_ONLY_DEMONS:                               # v3.0: only Pickens-type errors (a demon clearly below the regular line)
-        found = [x for x in found if x[3] == "demon"]
+        # v3.0: the clear ones only: a demon 15%+ BELOW the regular line, or a goblin 15%+ ABOVE it
+        # (then the REGULAR line is the mistake, like Tjen aces 4.5 with a goblin at 6.5)
+        found = [x[:7] for x in found if x[3] == "demon" or (x[3] == "regular" and len(x) > 7 and x[4] <= ERR_DEMON_GAP * x[7])]
+    found = [x[:7] for x in found]
     seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
     keys_now = set()
     for lg, P, stat, ot, line, direction, why in found:
@@ -2664,6 +2666,105 @@ def probe_apps():
             except Exception as e:
                 res.append(f"failed ({type(e).__name__})")
         print(f"APP TEST {app}: " + " || ".join(res))
+    try:
+        sample_apps(hdr)                            # v3.0: one sample record from Underdog and Sleeper (to build on)
+    except Exception as e:
+        print("APP SAMPLE error:", e)
+    try:
+        betr_discovery(hdr)
+    except Exception as e:
+        print("APP TEST BETR-FIND error:", e)
+
+
+def sample_apps(hdr):
+    """Log only: shows how Underdog's and Sleeper's lines are laid out, so the comparison can be built right."""
+    if _state.get("sampled"):
+        return
+    _state["sampled"] = True
+    try:
+        d = requests.get("https://api.underdogfantasy.com/v1/over_under_lines", headers=hdr, timeout=20).json()
+        ln = (d.get("over_under_lines") or [{}])[0]
+        print("APP SAMPLE UNDERDOG line:", json.dumps(ln)[:900])
+        print("APP SAMPLE UNDERDOG appearance:", json.dumps((d.get("appearances") or [{}])[0])[:400])
+        print("APP SAMPLE UNDERDOG player:", json.dumps((d.get("players") or [{}])[0])[:400])
+        print("APP SAMPLE UNDERDOG game:", json.dumps((d.get("games") or [{}])[0])[:400])
+    except Exception as e:
+        print("APP SAMPLE UNDERDOG failed:", e)
+    try:
+        d = requests.get("https://api.sleeper.app/lines/available?dynamic=true&include_preseason=true",
+                         headers=hdr, timeout=20).json()
+        rows = d if isinstance(d, list) else next((v for v in d.values() if isinstance(v, list)), [])
+        print("APP SAMPLE SLEEPER row:", json.dumps(rows[0] if rows else d)[:1200])
+    except Exception as e:
+        print("APP SAMPLE SLEEPER failed:", e)
+
+
+BETR_PAGES = ["https://picks.betr.app/", "https://app.betr.app/", "https://www.betr.app/picks", "https://betr.app/"]
+
+
+def _gql_block(js, name):
+    """Pulls 'query getUpcomingEventsV2 ... { ... }' out of a JavaScript bundle by matching the braces."""
+    i = js.find("query " + name)
+    if i < 0:
+        i = js.find(name + "(")
+        if i < 0:
+            return None
+        i = js.rfind("query", 0, i)
+        if i < 0:
+            return None
+    j = js.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, min(len(js), j + 20000)):
+        if js[k] == "{":
+            depth += 1
+        elif js[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[i:k + 1].replace("\\n", " ").replace("\n", " ")
+    return None
+
+
+def betr_discovery(hdr):
+    """v3.0 (log only): Betr gets in without a login when the bot sends Betr's OWN request, the one its web app uses.
+    This looks for that request inside Betr's website code and tries it once. Writes 'APP TEST BETR-FIND' lines."""
+    found = None
+    for page in BETR_PAGES:
+        try:
+            r = requests.get(page, headers=hdr, timeout=15)
+        except Exception as e:
+            print(f"APP TEST BETR-FIND: {page} failed ({type(e).__name__})")
+            continue
+        scripts = re.findall(r'<script[^>]+src="([^"]+\.js[^"]*)"', r.text or "")
+        print(f"APP TEST BETR-FIND: {page} -> {r.status_code}, {len(scripts)} scripts")
+        for src in scripts[:15]:
+            url = src if src.startswith("http") else requests.compat.urljoin(page, src)
+            try:
+                js = requests.get(url, headers=hdr, timeout=15).text or ""
+            except Exception:
+                continue
+            if "getUpcomingEventsV2" in js or "fantasy.betr.app" in js:
+                q = _gql_block(js, "getUpcomingEventsV2")
+                print(f"APP TEST BETR-FIND: found Betr's request in {url.split('/')[-1][:60]} "
+                      f"({'query ' + str(len(q)) + ' chars' if q else 'name only, no query text'})")
+                if q:
+                    found = q
+                    break
+        if found:
+            break
+    if not found:
+        print("APP TEST BETR-FIND: Betr's request was not found in their website code")
+        return
+    _state["betr_query"] = found
+    try:
+        r = requests.post("https://api.fantasy.betr.app/graphql", json={"query": found, "variables": {}},
+                          headers=dict(hdr, **{"Content-Type": "application/json", "Origin": "https://picks.betr.app"}),
+                          timeout=20)
+        txt = r.text or ""
+        print(f"APP TEST BETR-TRY: {r.status_code} {len(txt) // 1024}KB | {txt[:160]!r}")
+    except Exception as e:
+        print(f"APP TEST BETR-TRY: failed ({type(e).__name__})")
 
 
 # ====================== NBA PREGAME RECENT FORM (v2.7) ======================
