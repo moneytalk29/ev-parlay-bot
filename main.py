@@ -6,7 +6,7 @@ What it does
      before kickoff. The bot only posts when the player's pace and the score both push past that line.
      (The pregame channel still reads pregame lines, because that's what those picks are about.)
      LIVE NFL posts only QB Pass Yards and Pass Attempts (HB_NFL_LIVE_STATS). Rushing and receiving are a coin flip.
-     CS2 PREGAME: single "MAPS 1-2 Kills" / "MAP 1 Kills" lines from the player's kills per round (bo3.gg, free).
+     ESPORTS PICKS: turned OFF (they weren't hitting). Set HB_ESPORTS=true to turn them back on.
   3. While a game is live, reads the score, clock and player box score from ESPN's free public data.
   4. Projects the player's final total using the game script:
        NFL: a team that trails throws more and runs less; a team that leads runs more and throws less.
@@ -2015,7 +2015,7 @@ def nhl_form_pregame(board):
 # Valorant, LoL and CS2: a "(Combo)" kills line (2-3 players added together) is checked against the sum of the
 # same players' single lines. Only PrizePicks' own lines are used (no paid esports data).
 ES_LEAGUES = ("CS2", "CSGO", "CS", "LOL", "LEAGUE OF LEGENDS", "VAL", "VALORANT")
-ES_ON = os.getenv("HB_ESPORTS", "true").lower() == "true"
+ES_ON = os.getenv("HB_ESPORTS", "false").lower() == "true"   # v3.0: OFF (picks were not hitting)
 ES_GAP_MIN = float(os.getenv("HB_ES_GAP_MIN", "5"))          # combo must be 5+ kills away from the sum
 ES_GAP_PCT = float(os.getenv("HB_ES_GAP_PCT", "0.035"))      # ...and 3.5%+ of the line
 
@@ -2485,7 +2485,7 @@ def error_scan(raw):
                 for d in sorted(set(by["demon"])):
                     if d <= ERR_DEMON_GAP * s0 and (not mid_move or d <= 0.75 * s0):
                         found.append((lg, P, stat, "demon", d, "MORE",
-                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}\n➡️ Take the DEMON More: it's easier AND pays more"))
+                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}"))
             if mid_move:
                 continue
             # 1c) a GOBLIN at or above the regular line: then the REGULAR line is the easier one and pays more
@@ -2601,7 +2601,7 @@ def error_scan(raw):
         label = {"demon": " 😈 DEMON", "demon_value": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
         college = lg.startswith(("CFB", "CBB", "NCAA"))
         kind_txt = "💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR"   # value = strong form, not a pricing mistake
-        title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {direction} {line:g}"
+        title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {line:g}"
         print("LINE ERROR:", title, "|", why)
         dest = ERRORS_WEBHOOK_URL
         if dest:
@@ -2609,7 +2609,7 @@ def error_scan(raw):
                      "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
                                  "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}", "inline": False}],
                      "footer": {"text": "Model v3.0 • alert only • PrizePicks can fix a mistake fast, so check it's still there"}}
-            _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {direction} {line:g}**\n"
+            _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {line:g}**\n"
                                + ("🎓 College: not available in every state\n" if college else "") + PP_LINK_TXT)[:1900],
                    "embeds": [embed]}, dest)
 
