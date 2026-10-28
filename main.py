@@ -2657,7 +2657,7 @@ def _xstat(name):
     if not t or "fantasy" in t or "combo" in t or re.search(r"(1h|2h|1q|2q|3q|4q|1sthalf|quarter|period|inning|set)", t):
         return None
     for key, words in _XSTAT:
-        if any(t == w or t.startswith(w) for w in words):
+        if t in words:
             return key
     return None
 
@@ -2739,81 +2739,177 @@ def _ud_index():
     return out
 
 
+# minimum point gap for a cross-app ERROR (a % gap alone lies on tiny lines like QB rush yards 0.5 vs 2.5)
+XAPP_ERR_MIN = {"pts": 5, "reb": 3, "ast": 3, "pra": 7, "pr": 6, "pa": 6, "ra": 4, "3pm": 1.5, "stl": 1, "blk": 1,
+                "tov": 1.5, "passyds": 50, "rushyds": 20, "recyds": 20, "rushrec": 25, "passrush": 50, "rec": 2,
+                "passatt": 6, "passcmp": 5, "rushatt": 5, "sog": 1.5, "saves": 6, "hits": 1.5}
+XAPP_MIN_LINE = {"rushyds": 10.5, "recyds": 10.5, "rushrec": 15.5}   # skip tiny yards lines (backup QBs, kneel-downs)
+_SLP_WAGER = {"points": "pts", "rebounds": "reb", "assists": "ast", "threes_made": "3pm", "three_pointers_made": "3pm",
+              "pts_reb_ast": "pra", "points_rebounds_assists": "pra", "pts_reb": "pr", "points_rebounds": "pr",
+              "pts_ast": "pa", "points_assists": "pa", "reb_ast": "ra", "rebounds_assists": "ra", "steals": "stl",
+              "blocks": "blk", "turnovers": "tov", "passing_yards": "passyds", "pass_yards": "passyds",
+              "rushing_yards": "rushyds", "rush_yards": "rushyds", "receiving_yards": "recyds", "rec_yards": "recyds",
+              "receptions": "rec", "rush_rec_yards": "rushrec", "rushing_receiving_yards": "rushrec",
+              "pass_rush_yards": "passrush", "passing_attempts": "passatt", "pass_attempts": "passatt",
+              "passing_completions": "passcmp", "pass_completions": "passcmp", "rushing_attempts": "rushatt",
+              "rush_attempts": "rushatt", "shots_on_goal": "sog", "shots": "sog", "saves": "saves", "goalie_saves": "saves",
+              "hits": "hits", "blocked_shots": "blk"}
+
+
+def _slp_names(sport):
+    """Sleeper uses player numbers. Its free player list turns them into names (kept a day, names only)."""
+    cache = _state.setdefault("slp_names", {})
+    hit = cache.get(sport)
+    if hit and time.time() - hit[0] < 24 * 3600:
+        return hit[1]
+    try:
+        d = requests.get(f"https://api.sleeper.app/v1/players/{sport}", timeout=40).json()
+        names = {str(k): f"{v.get('first_name', '')} {v.get('last_name', '')}".strip()
+                 for k, v in d.items() if isinstance(v, dict)}
+        del d
+        gc.collect()
+    except Exception as e:
+        print(f"CROSS-APP: Sleeper {sport} player list failed:", e)
+        return hit[1] if hit else {}
+    cache[sport] = (time.time(), names)
+    return names
+
+
+def _slp_index():
+    """{(SPORT, player, stat key): (line, None, name, over x, under x)} from Sleeper's public board."""
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                         "Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "application/json"}
+    r = requests.get("https://api.sleeper.app/lines/available?dynamic=true&include_preseason=true", headers=hdr, timeout=30)
+    if r.status_code != 200:
+        print(f"CROSS-APP: Sleeper said {r.status_code}")
+        return None
+    rows = r.json()
+    del r
+    if isinstance(rows, dict):
+        rows = next((v for v in rows.values() if isinstance(v, list)), [])
+    groups, unknown = {}, set()
+    for row in rows or []:
+        for o in (row.get("options") or []) if isinstance(row, dict) else []:
+            if str(o.get("status") or "active") != "active" or str(o.get("line_type") or "normal") != "normal" \
+                    or str(o.get("game_status") or "pre_game") != "pre_game" or o.get("subject_type", "player") != "player":
+                continue
+            wt = str(o.get("wager_type") or "").lower()
+            k = _SLP_WAGER.get(wt)
+            if not k:
+                unknown.add(wt)
+                continue
+            sport = str(o.get("sport") or "").lower()
+            g = groups.setdefault((sport, str(o.get("subject_id")), k, o.get("game_id")), {})
+            g[str(o.get("outcome") or "").lower()] = (_num(o.get("outcome_value")), _num(o.get("payout_multiplier"), 0))
+    del rows
+    if unknown and not _state.get("slp_unknown_logged"):
+        _state["slp_unknown_logged"] = True
+        print("CROSS-APP: Sleeper stat names not used:", sorted(unknown)[:40])
+    out = {}
+    for (sport, sid, k, gid), g in groups.items():
+        if "over" not in g or "under" not in g or g["over"][0] != g["under"][0] or g["over"][0] <= 0:
+            continue
+        nm = _slp_names(sport).get(sid)
+        if nm:
+            out[(sport.upper(), _norm(nm), k)] = (g["over"][0], None, nm, g["over"][1], g["under"][1])
+    return out
+
+
 def cross_app_scan(raw):
     if time.time() - _state.get("xapp_t", 0) < XAPP_EVERY:
         return
     _state["xapp_t"] = time.time()
-    pp = _pp_regular_index(raw)
-    ud = _ud_index()
-    if ud is None:
-        return
+    apps = {"PRIZEPICKS": _pp_regular_index(raw)}
+    for name, fn in (("UNDERDOG", _ud_index), ("SLEEPER", _slp_index)):
+        try:
+            got = fn()
+        except Exception as e:
+            print(f"CROSS-APP: {name} failed:", e)
+            got = None
+        if got:
+            apps[name] = got
+    keys = set()
+    for name, idx in apps.items():
+        if name != "PRIZEPICKS":
+            keys |= set(idx)
     errs, vals = [], []
-    for key, u in ud.items():
-        p = pp.get(key)
-        if not p:
+    for key in keys:
+        have = {n: idx[key] for n, idx in apps.items() if key in idx}
+        if len(have) < 2:
             continue
-        if p[1] and u[1] and abs((p[1] - u[1]).total_seconds()) > 3 * 3600:
-            continue                                      # different games
-        lo_app, lo, hi_app, hi = ("UNDERDOG", u[0], "PRIZEPICKS", p[0]) if u[0] < p[0] else ("PRIZEPICKS", p[0], "UNDERDOG", u[0])
-        if hi <= 0 or lo == hi:
+        lo_app = min(have, key=lambda n: have[n][0])
+        lo = have[lo_app][0]
+        others = {n: v for n, v in have.items() if n != lo_app}
+        ref = min(v[0] for v in others.values())          # the lowest of the OTHER apps: lo must beat all of them
+        if ref <= 0 or lo >= ref:
             continue
-        gap = (hi - lo) / hi
-        row = (key, p, u, lo_app, lo, hi_app, hi, gap)
-        if gap >= XAPP_ERR_GAP:
+        if len(others) >= 2 and max(v[0] for v in others.values()) > ref * 1.15:
+            continue                                      # the other apps don't agree with each other: skip
+        if key[2] in XAPP_MIN_LINE and ref < XAPP_MIN_LINE[key[2]]:
+            continue
+        gap = (ref - lo) / ref
+        row = (key, have, lo_app, lo, ref, gap)
+        if gap >= XAPP_ERR_GAP and ref - lo >= XAPP_ERR_MIN.get(key[2], 2):
             errs.append(row)
-        elif gap >= XAPP_VAL_GAP and hi - lo >= XAPP_VAL_MIN:
+        elif gap >= XAPP_VAL_GAP and ref - lo >= XAPP_VAL_MIN:
             vals.append(row)
     if time.time() - _state.get("xapp_log_t", 0) > 3600:
         _state["xapp_log_t"] = time.time()
-        both = sum(1 for k in ud if k in pp)
-        print(f"CROSS-APP CHECK: PrizePicks {len(pp)} regular lines, Underdog {len(ud)} | {both} on both apps | "
-              f"{len(errs)} errors, {len(vals)} value | value channel {'set' if VALUE_WEBHOOK_URL else 'NOT SET (log only)'}")
+        print(f"CROSS-APP CHECK: " + ", ".join(f"{n} {len(i)}" for n, i in apps.items()) +
+              f" | {len(errs)} errors, {len(vals)} value | value channel {'set' if VALUE_WEBHOOK_URL else 'NOT SET (log only)'}")
     sent = _state.setdefault("err_sent", {})
     pend = _state.setdefault("xapp_pend", {})
-    now_keys = {f"X|{r[0]}|{r[4]:g}" for r in errs}
+    now_keys = {f"X|{r[0]}|{r[3]:g}" for r in errs}
     for k in [k for k in pend if k not in now_keys]:
         del pend[k]
-    for key, p, u, lo_app, lo, hi_app, hi, gap in sorted(errs, key=lambda r: -r[7]):
-        k = f"X|{key}|{lo:g}"
+    for row in sorted(errs, key=lambda r: -r[5]):
+        k = f"X|{row[0]}|{row[3]:g}"
         if k in sent:
             continue
         if k not in pend:                                 # must still be there on the next read (5 min) to post
             pend[k] = time.time()
             continue
         sent[k] = time.time()
-        _xpost("error", key, p, u, lo_app, lo, hi_app, hi, gap)
+        _xpost("error", *row)
     day = _now().strftime("%Y-%m-%d")
     n_today = sum(1 for k in sent if k.startswith(f"V|{day}|"))
-    for key, p, u, lo_app, lo, hi_app, hi, gap in sorted(vals, key=lambda r: -r[7]):
+    for row in sorted(vals, key=lambda r: -r[5]):
         if n_today >= XAPP_VAL_PER_DAY:
             break
-        k = f"V|{day}|{key}|{lo:g}"
+        k = f"V|{day}|{row[0]}|{row[3]:g}"
         if k in sent:
             continue
         sent[k] = time.time()
         n_today += 1
-        _xpost("value", key, p, u, lo_app, lo, hi_app, hi, gap)
+        _xpost("value", *row)
 
 
-def _xpost(kind, key, p, u, lo_app, lo, hi_app, hi, gap):
+_XNAME = {"pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
+          "rushrec": "Rush+Rec Yards", "passrush": "Pass+Rush Yards", "passyds": "Pass Yards", "rushyds": "Rush Yards",
+          "recyds": "Receiving Yards", "rec": "Receptions", "passatt": "Pass Attempts", "passcmp": "Completions",
+          "rushatt": "Rush Attempts", "sog": "Shots On Goal", "saves": "Saves", "hits": "Hits", "blk": "Blocks",
+          "stl": "Steals", "tov": "Turnovers", "pts": "Points", "reb": "Rebounds", "ast": "Assists"}
+
+
+def _xpost(kind, key, have, lo_app, lo, ref, gap):
     sport, _n, k = key
-    stat = next((w[0] for kk, w in _XSTAT if kk == k), k).replace("pts", "Pts ").title()
-    stat = {"pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
-            "rushrec": "Rush+Rec Yards", "passrush": "Pass+Rush Yards", "passyds": "Pass Yards", "rushyds": "Rush Yards",
-            "recyds": "Receiving Yards", "rec": "Receptions", "passatt": "Pass Attempts", "passcmp": "Completions",
-            "rushatt": "Rush Attempts", "sog": "Shots On Goal", "saves": "Saves", "hits": "Hits", "blk": "Blocks",
-            "stl": "Steals", "tov": "Turnovers", "pts": "Points", "reb": "Rebounds", "ast": "Assists"}.get(k, stat)
-    name = p[2] or u[2]
+    stat = _XNAME.get(k, k)
+    name = next((v[2] for v in have.values() if v[2]), _n)
+    pp = have.get("PRIZEPICKS")
     icon, dest = ("🚨", ERRORS_WEBHOOK_URL) if kind == "error" else ("💰", VALUE_WEBHOOK_URL)
-    ud_txt = f"Underdog: {u[0]:g} (Higher {u[3]:g}x / Lower {u[4]:g}x)"
-    body = f"{'PrizePicks: ' + format(p[0], 'g')}\n{ud_txt}\n{lo_app.title()} is {gap:.0%} lower"
+    lines = []
+    for app in ("PRIZEPICKS", "UNDERDOG", "SLEEPER"):
+        v = have.get(app)
+        if v:
+            lines.append(f"{app.title()}: {v[0]:g}" + (f" (More {v[3]:g}x / Less {v[4]:g}x)" if app != "PRIZEPICKS" and v[3] else ""))
+    body = "\n".join(lines)
     print(f"CROSS-APP {kind.upper()}: [{lo_app}] {name} {stat} {lo:g} | {body.replace(chr(10), ' | ')}")
     if not dest:
         return
-    title = f"{icon} [{lo_app}] {name} — {stat} {lo:g}"
-    embed = {"title": title, "description": body, "color": 15158332 if kind == "error" else 15844367,
-             "fields": [{"name": f"{name} ({sport})", "value": f"{p[3] and 'vs ' + p[3] + ' • '}starts {_start_txt(p[1])}",
-                         "inline": False}],
+    when = f"{pp[3] and 'vs ' + pp[3] + ' • '}starts {_start_txt(pp[1])}" if pp else sport
+    embed = {"title": f"{icon} [{lo_app}] {name} — {stat} {lo:g}", "description": body,
+             "color": 15158332 if kind == "error" else 15844367,
+             "fields": [{"name": f"{name} ({sport})", "value": when, "inline": False}],
              "footer": {"text": "Model v3.0 • alert only • lines move fast, check it's still there"}}
     _post({"content": f"{icon} **[{lo_app}] {name} — {stat} {lo:g}**"[:1900], "embeds": [embed]}, dest)
 
