@@ -2654,6 +2654,8 @@ _XSTAT = [  # (canonical key, words that identify it) - checked in order, most s
 
 def _xstat(name):
     t = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if t in ("fantasyscore", "fantasypoints", "fantasypts"):
+        return "fant"                                     # v3.0: NBA only, PrizePicks vs Sleeper only (same scoring)
     if not t or "fantasy" in t or "combo" in t or re.search(r"(1h|2h|1q|2q|3q|4q|1sthalf|quarter|period|inning|set)", t):
         return None
     for key, words in _XSTAT:
@@ -2686,6 +2688,8 @@ def _pp_regular_index(raw):
             nm = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
             k = _xstat(a.get("stat_display_name") or a.get("stat_type"))
             line = _num(a.get("line_score"))
+            if k == "fant" and lg != "NBA":
+                continue
             if lg and nm and k and line > 0 and " + " not in nm:
                 out[(lg, _norm(nm), k)] = (line, st, nm, a.get("description") or "")
         except Exception:
@@ -2716,7 +2720,7 @@ def _ud_index():
             ou = ln.get("over_under") or {}
             ast = ou.get("appearance_stat") or {}
             k = _xstat(ast.get("display_stat") or ast.get("stat"))
-            if not k:
+            if not k or k == "fant":
                 continue
             app = apps.get(ast.get("appearance_id")) or {}
             pl = players.get(app.get("player_id")) or {}
@@ -2740,9 +2744,10 @@ def _ud_index():
 
 
 # minimum point gap for a cross-app ERROR (a % gap alone lies on tiny lines like QB rush yards 0.5 vs 2.5)
-XAPP_ERR_MIN = {"pts": 5, "reb": 3, "ast": 3, "pra": 7, "pr": 6, "pa": 6, "ra": 4, "3pm": 1.5, "stl": 1, "blk": 1,
-                "tov": 1.5, "passyds": 50, "rushyds": 20, "recyds": 20, "rushrec": 25, "passrush": 50, "rec": 2,
+XAPP_ERR_MIN = {"fant": 8, "pts": 5, "reb": 3, "ast": 3, "pra": 7, "pr": 6, "pa": 6, "ra": 4, "3pm": 2, "stl": 2, "blk": 2,
+                "tov": 2, "passyds": 50, "rushyds": 20, "recyds": 20, "rushrec": 25, "passrush": 50, "rec": 2,
                 "passatt": 6, "passcmp": 5, "rushatt": 5, "sog": 1.5, "saves": 6, "hits": 1.5}
+XAPP_PRICED_IN = float(os.getenv("HB_CROSS_APP_PRICED_IN", "1.65"))   # More paying under 1.65x = not a mistake
 XAPP_MIN_LINE = {"rushyds": 10.5, "recyds": 10.5, "rushrec": 15.5}   # skip tiny yards lines (backup QBs, kneel-downs)
 _SLP_WAGER = {"points": "pts", "rebounds": "reb", "assists": "ast", "threes_made": "3pm", "three_pointers_made": "3pm",
               "pts_reb_ast": "pra", "points_rebounds_assists": "pra", "pts_reb": "pr", "points_rebounds": "pr",
@@ -2753,7 +2758,7 @@ _SLP_WAGER = {"points": "pts", "rebounds": "reb", "assists": "ast", "threes_made
               "pass_rush_yards": "passrush", "passing_attempts": "passatt", "pass_attempts": "passatt",
               "passing_completions": "passcmp", "pass_completions": "passcmp", "rushing_attempts": "rushatt",
               "rush_attempts": "rushatt", "shots_on_goal": "sog", "shots": "sog", "saves": "saves", "goalie_saves": "saves",
-              "hits": "hits", "blocked_shots": "blk"}
+              "hits": "hits", "blocked_shots": "blk", "fantasy_points": "fant", "fantasy_score": "fant", "fantasy_pts": "fant"}
 
 
 def _slp_names(sport):
@@ -2799,6 +2804,8 @@ def _slp_index():
                 unknown.add(wt)
                 continue
             sport = str(o.get("sport") or "").lower()
+            if k == "fant" and sport != "nba":
+                continue
             g = groups.setdefault((sport, str(o.get("subject_id")), k, o.get("game_id")), {})
             g[str(o.get("outcome") or "").lower()] = (_num(o.get("outcome_value")), _num(o.get("payout_multiplier"), 0))
     del rows
@@ -2845,13 +2852,14 @@ def cross_app_scan(raw):
             continue
         if len(others) >= 2 and max(v[0] for v in others.values()) > ref * 1.15:
             continue                                      # the other apps don't agree with each other: skip
-        if key[2] in XAPP_MIN_LINE and ref < XAPP_MIN_LINE[key[2]]:
-            continue
+        tiny = key[2] in XAPP_MIN_LINE and ref < XAPP_MIN_LINE[key[2]]   # e.g. QB rush yards 0.5 vs 2.5: value, not error
         gap = (ref - lo) / ref
         row = (key, have, lo_app, lo, ref, gap)
-        if gap >= XAPP_ERR_GAP and ref - lo >= XAPP_ERR_MIN.get(key[2], 2):
+        lo_more = have[lo_app][3] if lo_app != "PRIZEPICKS" and len(have[lo_app]) > 3 else 0
+        priced_in = bool(lo_more) and lo_more < XAPP_PRICED_IN    # the app already pays LESS for More: it knows
+        if not tiny and not priced_in and gap >= XAPP_ERR_GAP and ref - lo >= XAPP_ERR_MIN.get(key[2], 2):
             errs.append(row)
-        elif gap >= XAPP_VAL_GAP and ref - lo >= XAPP_VAL_MIN:
+        elif gap >= XAPP_VAL_GAP and ref - lo >= (3.0 if key[2] == "fant" else XAPP_VAL_MIN):
             vals.append(row)
     if time.time() - _state.get("xapp_log_t", 0) > 3600:
         _state["xapp_log_t"] = time.time()
@@ -2884,7 +2892,7 @@ def cross_app_scan(raw):
         _xpost("value", *row)
 
 
-_XNAME = {"pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
+_XNAME = {"fant": "Fantasy Score", "pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
           "rushrec": "Rush+Rec Yards", "passrush": "Pass+Rush Yards", "passyds": "Pass Yards", "rushyds": "Rush Yards",
           "recyds": "Receiving Yards", "rec": "Receptions", "passatt": "Pass Attempts", "passcmp": "Completions",
           "rushatt": "Rush Attempts", "sog": "Shots On Goal", "saves": "Saves", "hits": "Hits", "blk": "Blocks",
