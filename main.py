@@ -2256,6 +2256,8 @@ ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
      and v.strip().startswith("http")), None)
 ERR_ON = os.getenv("HB_ERRORS", "true").lower() == "true"
 ERR_ONLY_DEMONS = os.getenv("HB_ERRORS_ONLY_DEMONS", "true").lower() == "true"   # v3.0: only Pickens-type errors
+ERR_DEMON_BIG = float(os.getenv("HB_ERRORS_DEMON_BIG", "0.70"))     # v3.0: a demon must be 30%+ below the regular line
+ERR_DEMON_MIN_PTS = float(os.getenv("HB_ERRORS_DEMON_MIN_POINTS", "2"))  # ...and 2+ points below (4.5 vs 5.5 is NOT an error)
 ERR_DEMON_GAP = float(os.getenv("HB_ERRORS_DEMON_GAP", "0.85"))  # demon must be 15%+ below the regular line (34.5 vs 64)
 ERR_CONFIRM_S = float(os.getenv("HB_ERRORS_CONFIRM_SECONDS", "180"))   # must still be on the board 3 minutes later
 # v3.0: leagues to leave out of the error check (college props aren't allowed in every state). Comma list, PrizePicks names.
@@ -2434,6 +2436,27 @@ def _post_locks(locks, sent):
                    "embeds": [embed]}, LOCKS_WEBHOOK_URL)
 
 
+# v3.0: 🔥 FREE = a huge gap on a stat that piles up (yards, points, PRA...): the line is under 60% of the other line.
+# Low-count stats (soccer shots, goals, steals, blocks, TDs, aces...) are never "free": one bad game and it misses.
+_LOW_COUNT = ("shot", "goal", "save", "steal", "block", "touchdown", "td", "ace", "double fault", "home run", "stolen",
+              "sack", "interception", "3-pt", "3pt", "three", "made", "turnover", "foul", "hit", "assist", "card", "corner",
+              "break point", "tie break", "set", "map", "kill", "headshot", "walk", "rbi", "run", "strikeout")
+
+
+def _is_free(stat, why):
+    t = str(stat).lower()
+    nums = re.findall(r"(?:Normal line|Demon|Goblin): ([0-9.]+)", why)
+    if len(nums) < 2:
+        return False
+    a, b = sorted(float(x) for x in nums[:2])
+    if b <= 0:
+        return False
+    low = any(w in t for w in _LOW_COUNT) and not any(w in t for w in ("yard", "fantasy", "pts", "points", "rebs", "rebounds"))
+    if low:                                       # small stats (shots, steals...): only a HUGE gap, like Messi shots 2 vs 5
+        return a <= 0.45 * b and b - a >= 2
+    return a <= 0.6 * b
+
+
 def error_scan(raw):
     players, leagues, games = {}, {}, {}
     for inc in raw.get("included", []) or []:
@@ -2490,8 +2513,11 @@ def error_scan(raw):
             if std and by.get("demon"):
                 s0 = min(std)
                 for d in sorted(set(by["demon"])):
-                    if d <= ERR_DEMON_GAP * s0 and (not mid_move or d <= 0.75 * s0):
+                    if d <= ERR_DEMON_BIG * s0 and s0 - d >= ERR_DEMON_MIN_PTS and (not mid_move or d <= 0.75 * s0):
                         found.append((lg, P, stat, "demon", d, "MORE",
+                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}"))
+                    elif d <= 0.92 * s0 and s0 - d >= 1 and not mid_move:   # v3.0: smaller demon gap -> #value
+                        found.append((lg, P, stat, "demon_small", d, "MORE",
                                       f"Normal line: {s0:g}\n😈 Demon: {d:g}"))
             if mid_move:
                 continue
@@ -2591,7 +2617,8 @@ def error_scan(raw):
     if ERR_ONLY_DEMONS:                               # v3.0: only Pickens-type errors (a demon clearly below the regular line)
         # v3.0: the clear ones only: a demon 15%+ BELOW the regular line, or a goblin 15%+ ABOVE it
         # (then the REGULAR line is the mistake, like Tjen aces 4.5 with a goblin at 6.5)
-        found = [x[:7] for x in found if x[3] == "demon" or (x[3] == "regular" and len(x) > 7 and x[4] <= ERR_DEMON_GAP * x[7])]
+        found = [x[:7] for x in found if x[3] in ("demon", "demon_small")
+                 or (x[3] == "regular" and len(x) > 7 and x[4] <= ERR_DEMON_GAP * x[7])]
     found = [x[:7] for x in found]
     seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
     keys_now = set()
@@ -2607,12 +2634,14 @@ def error_scan(raw):
         if time.time() - seen[k] < ERR_CONFIRM_S:
             continue
         sent[k] = time.time()
-        label = {"demon": " 😈 DEMON", "demon_value": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
+        label = {"demon": " 😈 DEMON", "demon_value": " 😈 DEMON", "demon_small": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
         college = lg.startswith(("CFB", "CBB", "NCAA"))
-        kind_txt = "💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR"   # value = strong form, not a pricing mistake
+        kind_txt = "💰 VALUE" if ot == "demon_small" else ("💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR")   # value = strong form, not a pricing mistake
         title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {line:g}"
         print("LINE ERROR:", title, "|", why)
-        dest = ERRORS_WEBHOOK_URL
+        dest = VALUE_WEBHOOK_URL if ot == "demon_small" else ERRORS_WEBHOOK_URL
+        if dest == ERRORS_WEBHOOK_URL and _is_free(stat, why):
+            why = "🔥 FREE: the line is less than half of what PrizePicks itself expects\n" + why
         if dest:
             embed = {"title": title, "description": why, "color": 10181046 if ot == "demon_value" else 15158332,
                      "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
@@ -2822,6 +2851,105 @@ def _slp_index():
     return out
 
 
+_X2BOX = {"NBA": {"pts": "pts", "reb": "reb", "ast": "ast", "pra": "pra", "pr": "pr", "pa": "pa", "ra": "ra",
+                  "3pm": "fg3", "stl": "stl", "blk": "blk", "tov": None},
+          "NHL": {"sog": "sog", "saves": "saves", "hits": "hits", "blk": "nhl_blk"},
+          "NFL": {"passyds": "pass_yds", "rushyds": "rush_yds", "recyds": "rec_yds", "rec": "rec_cnt",
+                  "passatt": "pass_att", "passcmp": "pass_cmp", "rushatt": "rush_att"}}
+XLOCK_MAX_PER_DAY = int(os.getenv("HB_OTHER_APP_LOCKS_PER_DAY", "10"))
+
+
+def _xapp_locks(apps, raw):
+    """🔒 LOCK LEGS on Underdog / Sleeper: a regular line he cleared in EVERY recent game with room to spare,
+    heavy minutes / usage only (same rules as the PrizePicks goblin locks). Posted to the LOCKS channel."""
+    if not LOCKS_WEBHOOK_URL:
+        return
+    team = {}
+    leagues = {i["id"]: (i.get("attributes", {}).get("name") or "").upper() for i in raw.get("included", []) or []
+               if i.get("type") == "league"}
+    for inc in raw.get("included", []) or []:
+        if inc.get("type") == "new_player":
+            a = inc.get("attributes", {}) or {}
+            lg = leagues.get(((inc.get("relationships") or {}).get("league", {}).get("data") or {}).get("id"), "")
+            team[_norm(a.get("name", ""))] = (a.get("team") or "", lg)
+    _state["lock_budget"] = int(os.getenv("HB_LOCK_FETCH_PER_CYCLE", "6"))
+    nba_t = nhl_ts = nfl_t = None
+    sent = _state.setdefault("err_sent", {})
+    day = _now().astimezone(_ET).strftime("%Y-%m-%d") if _ET is not timezone.utc else _now().strftime("%Y-%m-%d")
+    n_today = sum(1 for k in sent if k.startswith(f"XLOCK|{day}|"))
+    cands = []
+    for app in ("UNDERDOG", "SLEEPER"):
+        for (sport, norm, k), v in (apps.get(app) or {}).items():
+            bk = _X2BOX.get(sport, {}).get(k)
+            tm = team.get(norm, ("", ""))[0]
+            if not bk or not tm:
+                continue
+            line = v[0]
+            vals, mn = None, None
+            if sport == "NBA":
+                nba_t = nba_t or nba_teams()
+                tid = _nba_team(nba_t, tm)
+                if not tid:
+                    continue
+                vals, mins = [], []
+                for eid, _al in _nba_team_games(tid):
+                    box = _state.get("nba_box", {}).get(eid)
+                    if box and box.get(norm) and bk in box[norm]:
+                        vals.append(box[norm][bk])
+                        mins.append(box[norm].get("minutes", 0))
+                if len(vals) < 8 or sum(mins) / len(mins) < LOCK_MIN_MINUTES:
+                    continue
+                mn = sum(mins) / len(mins)
+            elif sport == "NHL":
+                nhl_ts = nhl_ts or nhl_team_stats()
+                tid = _nhl_team(nhl_ts, tm)
+                vals = _nhl_form_values(norm, tid, bk) if tid else None
+                if not vals or len(vals) < 8:
+                    continue
+                if not _state.get("is_goalie", {}).get(norm):
+                    toi = _nhl_form_values(norm, tid, "toi") or []
+                    if not toi or sum(toi) / len(toi) < LOCK_NHL_TOI:
+                        continue
+            elif sport == "NFL":
+                nfl_t = nfl_t or _espn_teams("NFL")
+                tid = _nba_team(nfl_t, tm) if nfl_t else None
+                need = LOCK_NFL_VOLUME.get(bk)
+                if not tid or not need:
+                    continue
+                vals, vol, ready = [], [], True
+                for eid in _nfl_team_games(tid):
+                    box = _nfl_game_box(eid)
+                    if box is None:
+                        ready = False
+                        break
+                    r = box.get(norm)
+                    if r and bk in r:
+                        vals.append(r[bk])
+                        vol.append(r.get(need[0], 0))
+                if not ready or len(vals) < LOCK_NFL_GAMES or sum(vol) / len(vol) < need[1]:
+                    continue
+            if vals and min(vals) >= line + max(1.0, 0.15 * line):
+                cands.append((app, sport, v[2], k, line, vals, mn, v[3]))
+    cands.sort(key=lambda c: -(min(c[5]) - c[4]) / max(c[4], 1))
+    for app, sport, name, k, line, vals, mn, more_x in cands:
+        if n_today >= XLOCK_MAX_PER_DAY:
+            break
+        key = f"XLOCK|{day}|{app}|{name}|{k}|{line:g}"
+        if key in sent:
+            continue
+        sent[key] = time.time()
+        n_today += 1
+        stat = _XNAME.get(k, k)
+        why = (f"Cleared {line:g} in ALL of his last {len(vals)} games (lowest {min(vals):g}, averaging "
+               f"{sum(vals) / len(vals):.1f}{f', {mn:.0f} minutes a game' if mn else ''}). Last {len(vals)}: "
+               + ", ".join(f"{x:g}" for x in vals) + (f"\n{app.title()} pays More {more_x:g}x" if more_x else ""))
+        print(f"LOCK LEG [{app}]: {name} {stat} {line:g} | {why}")
+        embed = {"title": f"🔒 LOCK LEG — [{app}] {name} {stat} MORE {line:g}", "description": why, "color": 3066993,
+                 "fields": [{"name": f"{name} ({sport})", "value": app.title(), "inline": False}],
+                 "footer": {"text": "Model v3.0 • alert only • safe but low-paying. Check he's playing before you lock"}}
+        _post({"content": f"🔒 **[{app}] {name} — {stat} MORE {line:g}**"[:1900], "embeds": [embed]}, LOCKS_WEBHOOK_URL)
+
+
 def cross_app_scan(raw):
     if time.time() - _state.get("xapp_t", 0) < XAPP_EVERY:
         return
@@ -2835,6 +2963,10 @@ def cross_app_scan(raw):
             got = None
         if got:
             apps[name] = got
+    try:
+        _xapp_locks(apps, raw)                    # v3.0: 🔒 lock legs on Underdog and Sleeper lines too
+    except Exception as e:
+        print("other-app lock legs error:", e)
     keys = set()
     for name, idx in apps.items():
         if name != "PRIZEPICKS":
